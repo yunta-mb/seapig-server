@@ -2,157 +2,223 @@
 
 require 'websocket-eventmachine-server'
 require 'json'
-require 'set'
 require 'jsondiff'
+require 'hana'
+require 'set'
 
-$workers = {}
-$objects = {}
-$pongs = {}
+
+class String
+
+	def starexp
+		Regexp.new(Regexp.escape(self).gsub('\*','.*?'))
+	end
+
+
+	def starexp?
+		self.include?('*')
+	end
+
+end
+
+
 
 class SeapigObject
 
-	attr_reader :id, :version
-	attr_writer :worker
+	attr_reader :id, :version, :valid
+
+	@@objects_by_id = Hash.new { |hash,object_id|
+		puts "Creating: "+(object = SeapigObject.new(object_id)).id
+		hash[object_id] = object
+	}
+
+
+	def self.[](id)
+		@@objects_by_id[id]
+	end
+
+
+	def self.all
+		@@objects_by_id.values
+	end
+
+
+	def self.matching(id)
+		@@objects_by_id.values.select { |object| object.matches?(id) }
+	end
+
+
+	def matches?(id)
+		@id =~ id.starexp
+	end
 
 	
-	def initialize(id, object, version, observers)
+	def initialize(id)
 		@id = id
-		@object = object
-		@version = version
-		@version_needed = nil
-		@observers = observers
-		@worker = nil #F support calculation of more than 1 version at the same time
-		$objects[@id] = self
-		@observers.each { |observer| observer.send self.json_diff(nil, {}) } if @version
-		$objects.values.each { |object| object.check_validity } if @version
-		self.gc
-	end
-
-
-	def gc
-		return false if @observers.size > 0
-		$objects.values.each { |object|
-			return false if object.version.kind_of?(Hash) and object.version[@id]
-		}
-		$objects.delete(@id)
-	end
-
-
-	def link(socket)
-		@observers << socket
-	end
-
-
-	def unlink(socket)
-		@observers.delete(socket)
-		gc
+		@valid = false
+		@object = {}
+		@version = 0
+		@@objects_by_id[@id] = self
 	end
 
 	
-	def to_hash
-		{ id: @id, object: @object, version: @version }
-	end
-	
-
-	def json_diff(old_version, old_object)
-		 JSON.dump(
-			action: 'patch',
-			id: @id,
-			old_version: old_version,
-			new_version: @version,
-			patch: JsonDiff.generate(old_object, @object)
-		)
-
-	end
-
-
-	def update(object, version)
-		old = to_hash
-		@object = object
-		@version = version
-		@version_needed = @version if not @version_needed
-		@observers.each { |observer|
-			observer.send json_diff(old[:version],old[:object])
+	def self.gc
+		used_object_ids = Set.new
+		Client.all.each { |client| used_object_ids.merge(client.consumes.map { |object| object.id }) } #objects with direct consuments (no pattern matching)
+		@@objects_by_id.values.each { |object| used_object_ids << object.id if Client.all.find { |client| client.produces.include?(object.id) } and Client.all.find { |client| client.consumes.find { |consumed| consumed.id.starexp? and object.id =~ consumed.id.starexp } } } #objects having producers AND wildcard consuments
+		@@objects_by_id.values.each { |object| object.version.keys.each { |key| used_object_ids << key } if object.version.kind_of?(Hash) } # objects that others depend on
+		@@objects_by_id.keys.select { |id| not used_object_ids.include?(id) }.each { |id|
+			Client.all.select { |client| client.consumes.find { |object| object.id.starexp? and id =~ object.id.starexp } }.each { |client|
+				puts "Destroying: "+id
+				client.socket.send JSON.dump(action: 'object-destroy', id: id)
+			}
+			puts "Deleting: "+id
+			@@objects_by_id.delete(id) 
 		}
-		$objects.values.each { |object| object.check_validity }
 	end
 
 
-	def check_validity
-		return true if @version and (not @version.kind_of?(Hash))
-		version_needed = {}
-		@version.each_pair { |dependency_id, dependency_version|
-			version_needed[dependency_id] = $objects[dependency_id].version if $objects[dependency_id]
-		} if @version
-		#p :validity, self
-		if (not @version) or (@version.size == version_needed.size and @version != version_needed and @version_needed != version_needed)
-			@version_needed = version_needed if @version
-			self.inquire($workers.values) if not @worker
+	def patch(patch, value, from_version, new_version)
+		print "Patching version:"+@version.inspect+" from_version:"+from_version.inspect+" new_version:"+new_version.inspect+' --> '  
+		if from_version == @version or from_version == 0
+			puts 'Clean'
+			old_object = JSON.load(JSON.dump(@object))
+			old_version = @version
+			@object.clear if from_version == 0 or value
+			Hana::Patch.new(patch).apply(@object) if patch
+			@object.merge!(value) if value
+			@version = new_version
+			Client.all.each { |client| send(client, old_version, old_object) }
+			SeapigObject.all.each { |object| object.check_validity }
+		elsif from_version > @version
+			puts "Lost some updates, reinitializing object"
+			@version = 0
+			@object.clear
+			@valid = false
+		else
+			puts "Late update, ignoring"
 		end
 	end
 
 
-	def inquire(workers)
-		return if @version and (@version == @version_needed or @worker)
-		workers.each { |worker|
-			worker.inquire(self)
-		}
+	def send(client, old_version, old_object, patch = nil)
+		return false if not client.consumes.find { |object| (object == self) or self.matches?(object.id) }
+		puts 'Sending '+self.id
+		client.socket.send JSON.dump(
+					   action: 'object-update',
+					   id: @id,
+					   old_version: old_version,
+					   new_version: @version,
+					   patch: (patch or JsonDiff.generate(old_object, @object))) 
 	end
 
-
-	def assign(worker)
-		return if @version and (@version == @version_needed or @worker)		
-		@worker = worker if worker.assign(self)
+	
+	def check_validity
+		@valid = if not @version.kind_of?(Hash) then (@version > 0) else not @version.to_a.find { |dependency_id, dependency_version|
+						SeapigObject[dependency_id] and SeapigObject[dependency_id].version and SeapigObject[dependency_id].version > dependency_version
+					} end
 	end
-
 
 
 	def inspect
-		#'<SO:%s:%s:%s:%s>'%[@id,@version,@version_needed,@object.inspect]
-		'<SO:%s:%s:%s>'%[@id,@version,@version_needed]
+		'<SO:%s:%s:%s>'%[@id, @version, (@valid and 'V' or 'I')]
 	end
 	
 end
 
 
 
-class Worker
+class Client
+
+	attr_reader :produces, :consumes, :socket, :producing, :index
+	attr_accessor :options
+
+	@@clients_by_socket = {}
+	@@count = 0
+
+	
+	def self.[](id)
+		@@clients_by_socket[id]
+	end
+
+
+	def self.all
+		@@clients_by_socket.values
+	end
+
 
 	def initialize(socket)
+		@index = @@count += 1
+		puts 'Creating client: '+@index.to_s
 		@socket = socket
-		@object = nil
+		@options = {}
+		@produces = []
+		@consumes = []
+		@producing = nil
+		@@clients_by_socket[socket] = self
 	end
 	
 
-	def inquire(object)
-		#p :busy, @object
-		@socket.send JSON.dump(action: 'estimate', id: object.id) if not @object
+	def id
+		(@options['name'] or "") + ':' + @index.to_s
+	end
+
+
+	def destroy
+		puts 'Destroying client: '+@index.to_s
+		@@clients_by_socket.delete(@socket)
+		SeapigObject.gc
+		Client.all.find { |client| client.assign(@producing) } if @producing and SeapigObject.all.include?(@producing)
+	end
+
+
+	def producer_register(pattern)
+		@produces.push(pattern)
+		SeapigObject.all.each { |object| self.assign(object) }
+	end
+
+
+	def consumer_register(object)
+		@consumes.push(object)
+		Client.all.each { |client| client.produces.each { |pattern| SeapigObject[pattern] if (not pattern.starexp?) and (pattern =~ object.id.starexp) } } if object.id.starexp?
+		SeapigObject.matching(object.id).each { |object|
+			Client.all.find { |client| client.assign(object) }
+			object.send(self,nil,{}) if object.valid
+		}
 	end
 
 
 	def assign(object)
-		return false if @object
-		#p :assign, object
-		@socket.send JSON.dump(action: 'generate', id: object.id)
-		@object = object
+		puts 'Assign? %20s <> %-30s - %s'%[self.id, object.id, [object.valid,object.id.starexp?,@producing,Client.all.find { |client| client.producing == object },(not @produces.find { |pattern| object.id =~ pattern.starexp })].map { |b| b and 'T' or 'F' }.join('')]
+		return true if object.valid
+		return true if object.id.starexp?
+		return false if @producing
+		return true if Client.all.find { |client| client.producing == object }
+		return false if not @produces.find { |pattern| object.id =~ pattern.starexp }
+		puts 'Assigning: '+object.id+'    to: '+self.id
+		@socket.send JSON.dump(action: 'object-produce', id: object.id)
+		@producing = object
 	end
 
 
-	def free
-		#p :free, @object
-		@object.worker = nil if @object
-		@object = nil
+	def release(object)
+		puts 'Releasing: '+object.id+'    from: '+self.id
+		@producing = nil if @producing == object
 	end
 
-
-	def kill
-		if @object
-			@object.inquire($workers.values)
-			self.free
-		end
-		$workers.delete(@socket)
+	
+	def ping
+		@socket.ping
 	end
 
+	
+	def pong
+		@pong_time = Time.new
+	end
+
+	
+	def check_ping_timeout
+		@socket.close if Time.new - pong > 60
+	end
 end
 
 
@@ -165,64 +231,58 @@ EM.run {
 	WebSocket::EventMachine::Server.start(host: "0.0.0.0", port: 3001) { |client_socket|
 		
 		client_socket.onmessage { |message|
-			$pongs[client_socket] = Time.new
+			client = Client[client_socket]
 			message = JSON.load message
-			puts "Message: #{message['action']}"
+			puts "-"*80 + ' ' + Time.new.to_s + "\nMessage: %-20s    %-30s    %s:%s"%[client.id, message['action'], (message["id"] and "ID" or "Pattern"),(message["id"] or message["pattern"])]
+			object = SeapigObject[message['id']] if message['id']
 			case message['action']
-			when 'worker-register'
-				$workers[client_socket] = worker = Worker.new(client_socket)
-				$objects.values.each { |object| object.inquire([worker]) }
-			when 'worker-estimate'
-				object = $objects[message['id']]
-				object.assign($workers[client_socket]) if object
-			when 'update'
-				$workers[client_socket].free if $workers[client_socket]
-				if object = $objects[object_id = message['id']]
-					object.update(message['object'], message['version'])
-				else
-					SeapigObject.new(object_id, message['object'], message['version'], Set.new) #.inquire($workers.values)
+			when 'object-producer-register'
+				fail unless message['pattern']
+				client.producer_register(message['pattern'])
+			when 'object-producer-unregister'
+				fail unless message['pattern']
+				client.producer_unregister(message['pattern'])
+			when 'object-patch'
+				fail unless message['id'] and message['new_version'] and message['old_version']
+				SeapigObject.gc
+				if SeapigObject.all.include?(object) # ignoring objects nobody listens to
+					object.patch(message['patch'], message['value'], message['old_version'], message['new_version'])
+					client.release(object)
+					SeapigObject.all.each { |object| Client.all.find { |client| client.assign(object) } }
 				end
-				$objects.each_pair { |object_id, object| puts '- %25s: %s'%[object_id, object.inspect] }
-			when 'link'
-				if object = $objects[object_id = message['id']]
-					object.link(client_socket)
-					client_socket.send object.json_diff(nil, {})
-				else
-					SeapigObject.new(object_id, {}, nil, Set.new([client_socket])).inquire($workers.values)
-				end
-			when 'unlink'
-				if object = $objects[object_id = message['id']]
-					object.unlink(client_socket)
-				end
+			when 'object-consumer-register'
+				fail unless message['id']
+				client.consumer_register(object)
+			when 'object-consumer-unregister'
+				fail unless message['id']
+				client.consumer_unregister(object)
+			when 'client-options-set'
+				fail unless message['options']
+				client.options = message['options']
 			else
-				p 'wtf', message['action']
-
+				puts '***** WTF, got message with action: ' + message['action'].inspect
 			end
+			puts "Clients:\n"+Client.all.map { |client| "\t%-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
+			puts "Objects:\n"+SeapigObject.all.map { |object| "\t%s"%[object.inspect] }.join("\n")+"\n"
 		}
 
-		client_socket.onpong {
-			$pongs[client_socket] = Time.new
-		}
 		
-		client_socket.onclose {
-			puts "Client disconnected"
-			$pongs.delete(client_socket)
-			$workers[client_socket].kill if $workers[client_socket]
-			$objects.values.each { |object| object.unlink(client_socket) }
-		}
+		client_socket.onopen { Client.new(client_socket) }
+		client_socket.onclose { Client[client_socket].destroy if Client[client_socket] }
+		client_socket.onpong { Client[client_socket].pong }
 	}
 
 	
 	EM.add_periodic_timer(10) {
-		$pongs.keys.each { |client_socket|
-			client_socket.ping
+		Client.all.each { |client|
+			client.ping
 		}
 	}
 
 
 	EM.add_periodic_timer(10) {
-		$pongs.each_pair { |client_socket, pong|
-			client_socket.close if Time.new - pong > 60
+		Client.all.each { |client|
+			client.check_ping_timeout 
 		}
 	}
 	
