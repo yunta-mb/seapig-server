@@ -15,3 +15,4 @@ gemspec
 
 gem 'rdoc'
 gem 'hana'
+gem 'rake'
