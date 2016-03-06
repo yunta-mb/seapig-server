@@ -234,7 +234,8 @@ end
 
 
 
-
+processing_times = []
+processing_times_sum = 0
 
 EM.run {
 
@@ -242,6 +243,7 @@ EM.run {
 	WebSocket::EventMachine::Server.start(host: "0.0.0.0", port: 3001) { |client_socket|
 		
 		client_socket.onmessage { |message|
+			started_at = Time.new
 			client = Client[client_socket]
 			message = JSON.load message
 			puts "-"*80 + ' ' + Time.new.to_s + "\nMessage: %-20s    %-30s    %s:%s"%[client.id, message['action'], (message["id"] and "ID" or "Pattern"),(message["id"] or message["pattern"])]
@@ -273,8 +275,11 @@ EM.run {
 			else
 				puts '***** WTF, got message with action: ' + message['action'].inspect
 			end
+			processing_times << (Time.new.to_f - started_at.to_f)
+			processing_times_sum += processing_times[-1]
 			puts "Clients:\n"+Client.all.map { |client| "\t%-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
 			puts "Objects:\n"+SeapigObject.all.map { |object| "\t%s"%[object.inspect] }.join("\n")+"\n"
+			puts "Processing:\n\ttime: %.3fs\n\tcount: %i\n\taverage: %.3fs\n\ttotal: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
 		}
 
 		
