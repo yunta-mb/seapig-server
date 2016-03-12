@@ -57,6 +57,7 @@ class SeapigObject
 		@valid = false
 		@object = {}
 		@version = 0
+		@stall_after = nil
 		@@objects_by_id[@id] = self
 	end
 
@@ -78,34 +79,45 @@ class SeapigObject
 
 
 	def patch(patch, value, from_version, new_version)
-		print "Patching:\n\tversion:"+@version.inspect+"\n\tfrom_version: "+from_version.inspect+"\n\tnew_version: "+new_version.inspect+"\n\tpatch_size: "+(patch and patch.size.to_s or "nil")+"\n\t--> "  
+		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  
 		if from_version == @version or from_version == 0
-			puts 'Clean'
+			puts 'clean'
+			if value and @stall_after
+				puts '        UNSTALL'
+				@version = @stall_after
+				@stall_after = nil
+			end
 			old_object = JSON.load(JSON.dump(@object))
 			old_version = @version
-			@object.clear if from_version == 0 or value
+			@object.clear if from_version == 0 or value != nil
 			begin
 				Hana::Patch.new(patch).apply(@object) if patch
 			rescue Exception => e
-				puts "Patching failed!\n\tOld object: "+old_object.inspect+"\n\tPatch: "+patch.inspect
+				puts "Patching failed!\n        Old object: "+old_object.inspect+"\n        Patch: "+patch.inspect
 				raise e
+			end
+			if value == false and not @stall_after
+				puts '        STALL' 
+				@stall_after = old_version
 			end
 			@object.merge!(value) if value
 			@version = new_version
-			Client.all.each { |client| send(client, old_version, old_object) }
+			Client.all.each { |client| upload(client, old_version, old_object) }
 			SeapigObject.all.each { |object| object.check_validity }
 		elsif from_version > @version
-			puts "Lost some updates, reinitializing object"
+			puts "lost some updates, reinitializing object"
 			@version = 0
 			@object.clear
 			@valid = false
+			#assign mb?
 		else
-			puts "Late update, ignoring"
+			puts "late update, ignoring"
 		end
 	end
 
 
-	def send(client, old_version, old_object, patch = nil)
+	def upload(client, old_version, old_object, patch = nil)
+		return false if @stall_after
 		return false if not client.consumes.find { |object| (object == self) or self.matches?(object.id) }
 		puts 'Sending '+self.id
 		client.socket.send JSON.dump(
@@ -125,7 +137,7 @@ class SeapigObject
 
 
 	def inspect
-		'<SO:%s:%s:%s>'%[@id, @version, (@valid and 'V' or 'I')]
+		'<SO:%s:%s:%s%s>'%[@id, @version, (@valid and 'V' or 'I'), (@stall_after and 'S' or 'U')]
 	end
 	
 end
@@ -187,7 +199,7 @@ class Client
 		Client.all.each { |client| client.produces.each { |pattern| SeapigObject[pattern] if (not pattern.starexp?) and (pattern =~ object.id.starexp) } } if object.id.starexp?
 		SeapigObject.matching(object.id).each { |object|
 			Client.all.find { |client| client.assign(object) }
-			object.send(self,0,{}) if object.valid
+			object.upload(self,0,{}) if object.valid
 		}
 	end
 
@@ -277,9 +289,10 @@ EM.run {
 			end
 			processing_times << (Time.new.to_f - started_at.to_f)
 			processing_times_sum += processing_times[-1]
-			puts "Clients:\n"+Client.all.map { |client| "\t%-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
-			puts "Objects:\n"+SeapigObject.all.map { |object| "\t%s"%[object.inspect] }.join("\n")+"\n"
-			puts "Processing:\n\ttime: %.3fs\n\tcount: %i\n\taverage: %.3fs\n\ttotal: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
+			puts "Clients:\n"+Client.all.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
+			puts "Objects:\n"+SeapigObject.all.map { |object| "        %s"%[object.inspect] }.join("\n")+"\n"
+			puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
+			STDOUT.flush
 		}
 
 		
