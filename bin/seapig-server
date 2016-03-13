@@ -1,4 +1,5 @@
 #!/bin/env ruby
+# coding: utf-8
 
 require 'websocket-eventmachine-server'
 require 'json'
@@ -73,13 +74,13 @@ class SeapigObject
 				client.socket.send JSON.dump(action: 'object-destroy', id: id)
 			}
 			puts "Deleting: "+id
-			@@objects_by_id.delete(id) 
+			@@objects_by_id.delete(id)
 		}
 	end
 
 
 	def patch(patch, value, from_version, new_version)
-		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  
+		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  
 		if from_version == @version or from_version == 0
 			puts 'clean'
 			if value and @stall_after
@@ -242,6 +243,12 @@ class Client
 	def check_ping_timeout
 		@socket.close if Time.new - pong > 60
 	end
+
+
+	def send_heartbeat
+		@socket.send JSON.dump(action: 'heartbeat') if @options['heartbeat']
+	end
+
 end
 
 
@@ -303,17 +310,8 @@ EM.run {
 
         Socket.open(:UNIX, :DGRAM)  { |s| s.connect(Socket.pack_sockaddr_un(ENV['NOTIFY_SOCKET'])); s.sendmsg "READY=1" } if ENV['NOTIFY_SOCKET']
 	
-	EM.add_periodic_timer(10) {
-		Client.all.each { |client|
-			client.ping
-		}
-	}
-
-
-	EM.add_periodic_timer(10) {
-		Client.all.each { |client|
-			client.check_ping_timeout 
-		}
-	}
+	EM.add_periodic_timer(10) { Client.all.each { |client|	client.ping  } }
+	EM.add_periodic_timer(10) { Client.all.each { |client|	client.check_ping_timeout  } }
+	EM.add_periodic_timer(10) { Client.all.each { |client|	client.send_heartbeat  } }
 	
 }
