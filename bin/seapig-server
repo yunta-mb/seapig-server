@@ -65,6 +65,7 @@ class SeapigObject
 	
 	def self.gc
 		used_object_ids = Set.new
+		Client.all.each { |client| used_object_ids << client.producing if client.producing } #objects currently being produced
 		Client.all.each { |client| used_object_ids.merge(client.consumes.map { |object| object.id }) } #objects with direct consuments (no pattern matching)
 		@@objects_by_id.values.each { |object| used_object_ids << object.id if Client.all.find { |client| client.produces.include?(object.id) } and Client.all.find { |client| client.consumes.find { |consumed| consumed.id.starexp? and object.id =~ consumed.id.starexp } } } #objects having producers AND wildcard consuments
 		@@objects_by_id.values.each { |object| object.version.keys.each { |key| used_object_ids << key } if object.version.kind_of?(Hash) } # objects that others depend on
@@ -80,11 +81,11 @@ class SeapigObject
 
 
 	def patch(patch, value, from_version, new_version)
-		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  
+		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  
 		if from_version == @version or from_version == 0
 			puts 'clean'
 			if value and @stall_after
-				puts '        UNSTALL'
+				puts '        UNSTALL'
 				@version = @stall_after
 				@stall_after = nil
 			end
@@ -94,11 +95,11 @@ class SeapigObject
 			begin
 				Hana::Patch.new(patch).apply(@object) if patch
 			rescue Exception => e
-				puts "Patching failed!\n        Old object: "+old_object.inspect+"\n        Patch: "+patch.inspect
+				puts "Patching failed!\n        Old object: "+old_object.inspect+"\n        Patch: "+patch.inspect
 				raise e
 			end
 			if value == false and not @stall_after
-				puts '        STALL' 
+				puts '        STALL' 
 				@stall_after = old_version
 			end
 			@object.merge!(value) if value
@@ -120,13 +121,14 @@ class SeapigObject
 	def upload(client, old_version, old_object, patch = nil)
 		return false if @stall_after
 		return false if not client.consumes.find { |object| (object == self) or self.matches?(object.id) }
-		puts 'Sending '+self.id
-		client.socket.send JSON.dump(
-					   action: 'object-update',
-					   id: @id,
-					   old_version: old_version,
-					   new_version: @version,
-					   patch: (patch or JsonDiff.generate(old_object, @object))) 
+		json = JSON.dump(
+			action: 'object-update',
+			id: @id,
+			old_version: old_version,
+			new_version: @version,
+			patch: (patch or JsonDiff.generate(old_object, @object))) 
+		puts "Sending  %8iB  %s to "%[json.size, self.id, client.id]
+		client.socket.send json
 	end
 
 	
@@ -276,12 +278,10 @@ EM.run {
 				client.producer_unregister(message['pattern'])
 			when 'object-patch'
 				fail unless message['id'] and message['new_version'] and message['old_version']
+				client.release(object)
 				SeapigObject.gc
-				if SeapigObject.all.include?(object) # ignoring objects nobody listens to
-					object.patch(message['patch'], message['value'], message['old_version'], message['new_version'])
-					client.release(object)
-					SeapigObject.all.each { |object| Client.all.find { |client| client.assign(object) } }
-				end
+				object.patch(message['patch'], message['value'], message['old_version'], message['new_version']) if SeapigObject.all.include?(object) # ignoring objects nobody listens to
+				SeapigObject.all.each { |object| Client.all.find { |client| client.assign(object) } }
 			when 'object-consumer-register'
 				fail unless message['id']
 				client.consumer_register(object)
@@ -296,9 +296,9 @@ EM.run {
 			end
 			processing_times << (Time.new.to_f - started_at.to_f)
 			processing_times_sum += processing_times[-1]
-			puts "Clients:\n"+Client.all.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
-			puts "Objects:\n"+SeapigObject.all.map { |object| "        %s"%[object.inspect] }.join("\n")+"\n"
-			puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
+			puts "Clients:\n"+Client.all.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
+			puts "Objects:\n"+SeapigObject.all.map { |object| "        %s"%[object.inspect] }.join("\n")+"\n"
+			puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
 			STDOUT.flush
 		}
 
