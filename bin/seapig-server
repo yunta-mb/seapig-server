@@ -65,7 +65,7 @@ class SeapigObject
 	
 	def self.gc
 		used_object_ids = Set.new
-		Client.all.each { |client| used_object_ids << client.producing if client.producing } #objects currently being produced
+		Client.all.each { |client| used_object_ids << client.producing.id if client.producing } #objects currently being produced
 		Client.all.each { |client| used_object_ids.merge(client.consumes.map { |object| object.id }) } #objects with direct consuments (no pattern matching)
 		@@objects_by_id.values.each { |object| used_object_ids << object.id if Client.all.find { |client| client.produces.include?(object.id) } and Client.all.find { |client| client.consumes.find { |consumed| consumed.id.starexp? and object.id =~ consumed.id.starexp } } } #objects having producers AND wildcard consuments
 		@@objects_by_id.values.each { |object| object.version.keys.each { |key| used_object_ids << key } if object.version.kind_of?(Hash) } # objects that others depend on
@@ -127,7 +127,7 @@ class SeapigObject
 			old_version: old_version,
 			new_version: @version,
 			patch: (patch or JsonDiff.generate(old_object, @object))) 
-		puts "Sending  %8iB  %s to "%[json.size, self.id, client.id]
+		puts "Sending  %8iB  %s to %s"%[json.size, self.id, client.id]
 		client.socket.send json
 	end
 
