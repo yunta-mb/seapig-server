@@ -7,6 +7,9 @@ require 'jsondiff'
 require 'hana'
 require 'set'
 
+DEBUG = (ARGV[0] == "debug")
+INFO = (DEBUG or ARGV[0] == "info")
+
 
 class String
 
@@ -28,7 +31,8 @@ class SeapigObject
 	attr_reader :id, :version, :valid
 
 	@@objects_by_id = Hash.new { |hash,object_id|
-		puts "Creating: "+(object = SeapigObject.new(object_id)).id
+		object = SeapigObject.new(object_id)
+		puts "Creating: "+object.id if DEBUG
 		hash[object_id] = object
 	}
 
@@ -71,21 +75,21 @@ class SeapigObject
 		@@objects_by_id.values.each { |object| object.version.keys.each { |key| used_object_ids << key } if object.version.kind_of?(Hash) } # objects that others depend on
 		@@objects_by_id.keys.select { |id| not used_object_ids.include?(id) }.each { |id|
 			Client.all.select { |client| client.consumes.find { |object| object.id.starexp? and id =~ object.id.starexp } }.each { |client|
-				puts "Destroying: "+id
+				puts "Destroying: "+id if DEBUG
 				client.socket.send JSON.dump(action: 'object-destroy', id: id)
 			}
-			puts "Deleting: "+id
+			puts "Deleting: "+id if DEBUG
 			@@objects_by_id.delete(id)
 		}
 	end
 
 
 	def patch(patch, value, from_version, new_version)
-		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  
+		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "   if DEBUG
 		if from_version == @version or from_version == 0
-			puts 'clean'
+			puts 'clean' if DEBUG
 			if value and @stall_after
-				puts '        UNSTALL'
+				puts '        UNSTALL' if DEBUG
 				@version = @stall_after
 				@stall_after = nil
 			end
@@ -95,11 +99,11 @@ class SeapigObject
 			begin
 				Hana::Patch.new(patch).apply(@object) if patch
 			rescue Exception => e
-				puts "Patching failed!\n        Old object: "+old_object.inspect+"\n        Patch: "+patch.inspect
+				puts "Patching failed!\n        Old object: "+old_object.inspect+"\n        Patch: "+patch.inspect if DEBUG
 				raise e
 			end
 			if value == false and not @stall_after
-				puts '        STALL' 
+				puts '        STALL' if DEBUG
 				@stall_after = old_version
 			end
 			@object.merge!(value) if value
@@ -107,13 +111,13 @@ class SeapigObject
 			Client.all.each { |client| upload(client, old_version, old_object) }
 			SeapigObject.all.each { |object| object.check_validity }
 		elsif from_version > @version
-			puts "lost some updates, reinitializing object"
+			puts "lost some updates, reinitializing object" if DEBUG
 			@version = 0
 			@object.clear
 			@valid = false
 			#assign mb?
 		else
-			puts "late update, ignoring"
+			puts "late update, ignoring" if DEBUG
 		end
 	end
 
@@ -121,13 +125,15 @@ class SeapigObject
 	def upload(client, old_version, old_object, patch = nil)
 		return false if @stall_after
 		return false if not client.consumes.find { |object| (object == self) or self.matches?(object.id) }
+		old_version, old_object = [0, {}] if not client.versions[self] == old_version
 		json = JSON.dump(
 			action: 'object-update',
 			id: @id,
 			old_version: old_version,
 			new_version: @version,
 			patch: (patch or JsonDiff.generate(old_object, @object))) 
-		puts "Sending  %8iB  %s to %s"%[json.size, self.id, client.id]
+		puts "Sending  %8iB  %s to %s"%[json.size, self.id, client.id] if DEBUG
+		client.versions[self] = @version
 		client.socket.send json
 	end
 
@@ -149,7 +155,7 @@ end
 
 class Client
 
-	attr_reader :produces, :consumes, :socket, :producing, :index
+	attr_reader :produces, :consumes, :socket, :producing, :index, :versions
 	attr_accessor :options
 
 	@@clients_by_socket = {}
@@ -168,11 +174,12 @@ class Client
 
 	def initialize(socket)
 		@index = @@count += 1
-		puts 'Creating client: '+@index.to_s
+		puts 'Client connected: '+@index.to_s if DEBUG
 		@socket = socket
 		@options = {}
 		@produces = []
 		@consumes = []
+		@versions = {}
 		@producing = nil
 		@@clients_by_socket[socket] = self
 	end
@@ -184,7 +191,7 @@ class Client
 
 
 	def destroy
-		puts 'Destroying client: '+@index.to_s
+		puts 'Client disconnected: '+@index.to_s if DEBUG
 		@@clients_by_socket.delete(@socket)
 		SeapigObject.gc
 		Client.all.find { |client| client.assign(@producing) } if @producing and SeapigObject.all.include?(@producing)
@@ -209,25 +216,26 @@ class Client
 
 	def consumer_unregister(object)
 		@consumes.delete(object)
+		@versions.delete(object)
 		SeapigObject.gc
 	end
 
 
 	def assign(object)
-		puts 'Assign? %20s <> %-30s - %s'%[self.id, object.id, [object.valid,object.id.starexp?,@producing,Client.all.find { |client| client.producing == object },(not @produces.find { |pattern| object.id =~ pattern.starexp })].map { |b| b and 'T' or 'F' }.join('')]
+		puts 'Assign? %20s <> %-30s - %s'%[self.id, object.id, [object.valid,object.id.starexp?,@producing,Client.all.find { |client| client.producing == object },(not @produces.find { |pattern| object.id =~ pattern.starexp })].map { |b| b and 'T' or 'F' }.join('')] if DEBUG
 		return true if object.valid
 		return true if object.id.starexp?
 		return false if @producing
 		return true if Client.all.find { |client| client.producing == object }
 		return false if not @produces.find { |pattern| object.id =~ pattern.starexp }
-		puts 'Assigning: '+object.id+'    to: '+self.id
+		puts 'Assigning: '+object.id+'    to: '+self.id if DEBUG
 		@socket.send JSON.dump(action: 'object-produce', id: object.id)
 		@producing = object
 	end
 
 
 	def release(object)
-		puts 'Releasing: '+object.id+'    from: '+self.id
+		puts 'Releasing: '+object.id+'    from: '+self.id if DEBUG
 		@producing = nil if @producing == object
 	end
 
@@ -254,7 +262,6 @@ class Client
 end
 
 
-
 processing_times = []
 processing_times_sum = 0
 
@@ -267,7 +274,9 @@ EM.run {
 			started_at = Time.new
 			client = Client[client_socket]
 			message = JSON.load message
-			puts "-"*80 + ' ' + Time.new.to_s + "\nMessage: %-20s    %-30s    %s:%s"%[client.id, message['action'], (message["id"] and "ID" or "Pattern"),(message["id"] or message["pattern"])]
+			puts "-"*80 + ' ' + Time.new.to_s if DEBUG
+			print "Message: %-20s    %-30s    %-50s"%[client.id, message['action'], JSON.dump(message.select { |k,v| ['pattern','id','options'].include?(k) })] if INFO
+			puts if DEBUG
 			object = SeapigObject[message['id']] if message['id']
 			case message['action']
 			when 'object-producer-register'
@@ -296,10 +305,14 @@ EM.run {
 			end
 			processing_times << (Time.new.to_f - started_at.to_f)
 			processing_times_sum += processing_times[-1]
-			puts "Clients:\n"+Client.all.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
-			puts "Objects:\n"+SeapigObject.all.map { |object| "        %s"%[object.inspect] }.join("\n")+"\n"
-			puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
-			STDOUT.flush
+			if DEBUG
+				puts "Clients:\n"+Client.all.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
+				puts "Objects:\n"+SeapigObject.all.map { |object| "        %s"%[object.inspect] }.join("\n")+"\n"
+				puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
+				STDOUT.flush
+			end
+			puts "ct:%3i  t:%.3fs  Σt:%.3fs  t̅:%.3fs"%[processing_times.size, processing_times[-1],   processing_times_sum, processing_times_sum / processing_times.size,] if INFO and not DEBUG
+
 		}
 
 		
