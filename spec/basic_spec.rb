@@ -149,7 +149,7 @@ RSpec.describe "Seapig Server" do
 			@client.send(action: 'object-patch', id: 'test-object', value: false, old_version: 2, new_version: 3)
 			expect(@client.messages).to eq([])
 			@client.send(action: 'object-patch', id: 'test-object', value: {"f"=>3}, old_version: 3, new_version: 4)
-			expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object", "old_version"=>2, "new_version"=>4, "patch"=>[{"op"=>"add", "path"=>"/f", "value"=>3}, {"op"=>"remove", "path"=>"/x"}]}])
+			expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object", "old_version"=>2, "new_version"=>4, "patch"=>[{"op"=>"remove", "path"=>"/x"}, {"op"=>"add", "path"=>"/f", "value"=>3}]}])
 		end
 
 
