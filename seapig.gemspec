@@ -20,7 +20,9 @@ Gem::Specification.new do |s|
   s.require_paths = ["lib"]
 
   s.add_dependency "websocket-eventmachine-server"
-  s.add_dependency "jsondiff"
+  s.add_dependency "narray"
+  s.add_dependency "json-diff"
   s.add_dependency "hana"
+  s.add_dependency "oj"
 
 end

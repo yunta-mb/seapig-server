@@ -14,5 +14,4 @@ gemspec
 # gem 'byebug', group: [:development, :test]
 
 gem 'rdoc'
-gem 'hana'
 gem 'rake'

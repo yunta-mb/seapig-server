@@ -2,13 +2,41 @@
 # coding: utf-8
 
 require 'websocket-eventmachine-server'
-require 'json'
-require 'jsondiff'
+require 'narray'
+require 'oj'
+require 'json-diff'
 require 'hana'
 require 'set'
 
+
 DEBUG = (ARGV[0] == "debug")
 INFO = (DEBUG or ARGV[0] == "info")
+HOST = (ARGV[1] or "127.0.0.1").split(":")[0]
+PORT = ((ARGV[1] or '').split(':')[1] or "3001").to_i
+
+OBJECT_CACHE_SIZE = 1
+
+$stdout.sync = true
+
+Oj.default_options = { mode: :strict }
+
+
+module WebSocket
+	module Frame
+		class Data < String
+			def getbytes(start_index, count)
+				data = self[start_index, count]
+				if @masking_key
+					payload_na = NArray.to_na(data,"byte")
+					mask_na = NArray.to_na((@masking_key.pack("C*")*((data.size/4) + 1))[0...data.size],"byte")
+					data = (mask_na ^ payload_na).to_s
+				end
+				data
+			end
+		end
+	end
+end
+
 
 
 class String
@@ -25,165 +53,416 @@ class String
 end
 
 
-
-class SeapigObject
-
-	attr_reader :id, :version, :valid
-
-	@@objects_by_id = Hash.new { |hash,object_id|
-		object = SeapigObject.new(object_id)
-		puts "Creating: "+object.id if DEBUG
-		hash[object_id] = object
-	}
+Signal.trap("USR1") {
+	t1 = Time.new;  GC.start  ;d = Time.new - t1
+	puts "Long GC run:\n        %.3fs"%(d) if DEBUG and d > 0.05
+}
 
 
-	def self.[](id)
-		@@objects_by_id[id]
-	end
+#
+# Code is layered, with each layer only communicating with neighbouring layers (e.g. object store never directly talks to em or sockets).
+#
+# Object Store is a singleton responsible for:
+#    * managing objects' lifetime
+#    * dependency tracking and triggering object rebuilds (aka. production)
+#    * tracking of available producers and consumers
+#
+# Client class is responsible for:
+#    * keeping track of clients and their state
+#    * keeping network communication efficient (diffing)
+#
+# Eventmachine main loop is a:
+#    * router between physical world and Client class / instances
+#
 
 
-	def self.all
-		@@objects_by_id.values
-	end
+module SeapigObjectStore
+
+	@@objects_by_id = {} # {id => object}; stores all existing SeapigObjects
+
+	@@producers = {} # {pattern_or_id => {client}}; for assessing spawning possibility
+	@@consumers = {} # {pattern_or_id => {client}}; for assessing spawning need, for assessing holding need
+
+	@@dependents = {}   # {id_depended_on => {id_depending}}; for assessing spawning need, for assessing holding need, for assessing reproduction need
+	@@dependencies = {} # {id_depending => {id_depended_on}}; for updating dependents
+
+	@@queue = []      # [object]; objects in need of production
+	@@producing = {}  # {client => object}; for assessing client busy status
+	@@produced = {}   # {id_being_produced => {version}}; for assessing enqueuing/dequeuing need
 
 
-	def self.matching(id)
-		@@objects_by_id.values.select { |object| object.matches?(id) }
-	end
-
-
-	def matches?(id)
-		@id =~ id.starexp
-	end
-
-	
-	def initialize(id)
-		@id = id
-		@valid = false
-		@object = {}
-		@version = 0
-		@stall_after = nil
-		@@objects_by_id[@id] = self
-	end
-
-	
-	def self.gc
-		used_object_ids = Set.new
-		Client.all.each { |client| used_object_ids << client.producing.id if client.producing } #objects currently being produced
-		Client.all.each { |client| used_object_ids.merge(client.consumes.map { |object| object.id }) } #objects with direct consuments (no pattern matching)
-		@@objects_by_id.values.each { |object| used_object_ids << object.id if Client.all.find { |client| client.produces.include?(object.id) } and Client.all.find { |client| client.consumes.find { |consumed| consumed.id.starexp? and object.id =~ consumed.id.starexp } } } #objects having producers AND wildcard consuments
-		@@objects_by_id.values.each { |object| object.version.keys.each { |key| used_object_ids << key } if object.version.kind_of?(Hash) } # objects that others depend on
-		@@objects_by_id.keys.select { |id| not used_object_ids.include?(id) }.each { |id|
-			Client.all.select { |client| client.consumes.find { |object| object.id.starexp? and id =~ object.id.starexp } }.each { |client|
-				puts "Destroying: "+id if DEBUG
-				client.socket.send JSON.dump(action: 'object-destroy', id: id)
-			}
-			puts "Deleting: "+id if DEBUG
-			@@objects_by_id.delete(id)
+	def self.consumer_register(pattern_or_id, client)
+		@@consumers[pattern_or_id] = Set.new if not @@consumers[pattern_or_id]
+		@@consumers[pattern_or_id].add(client)
+		self.matching(pattern_or_id, @@producers.merge(@@objects_by_id)).each { |matching_id|
+			@@objects_by_id[matching_id].consumer_register(pattern_or_id, client) if @@objects_by_id[matching_id]
+			self.spawn(matching_id) if not @@objects_by_id[matching_id]
 		}
 	end
 
 
-	def patch(patch, value, from_version, new_version)
-		print "Patching:\n        version:"+@version.inspect+"\n        from_version: "+from_version.inspect+"\n        new_version: "+new_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "   if DEBUG
-		if from_version == @version or from_version == 0
-			puts 'clean' if DEBUG
-			if value and @stall_after
-				puts '        UNSTALL' if DEBUG
-				@version = @stall_after
-				@stall_after = nil
+	def self.producer_register(pattern_or_id, client)
+		@@producers[pattern_or_id] = Set.new if not @@producers[pattern_or_id]
+		@@producers[pattern_or_id].add(client)
+		self.matching(pattern_or_id, @@consumers.merge(@@dependents)).each { |matching_id|
+			@@objects_by_id[matching_id].producer_register(pattern_or_id, client) if @@objects_by_id[matching_id]
+			self.spawn(matching_id) if not @@objects_by_id[matching_id]
+		}
+		self.dequeue(client,nil) if not @@producing[client]
+	end
+
+
+	def self.consumer_unregister(pattern_or_id, client)
+		raise "Unregister without register" if not @@consumers[pattern_or_id].include?(client)
+		@@consumers[pattern_or_id].delete(client)
+		@@consumers.delete(pattern_or_id) if @@consumers[pattern_or_id].size == 0
+		self.matching(pattern_or_id,@@producers.merge(@@objects_by_id)).each { |matching_id|
+			@@objects_by_id[matching_id].consumer_unregister(pattern_or_id, client) if @@objects_by_id[matching_id]
+			self.despawn(@@objects_by_id[matching_id]) if @@objects_by_id[matching_id] and (not @@objects_by_id[matching_id].alive?) and (not @@dependents[pattern_or_id])
+		}
+	end
+
+
+	def self.producer_unregister(pattern_or_id,client)
+		raise "Unregister without register" if not @@producers[pattern_or_id].include?(client)
+		@@producers[pattern_or_id].delete(client)
+		@@producers.delete(pattern_or_id) if @@producers[pattern_or_id].size == 0
+		self.matching(pattern_or_id,@@consumers.merge(@@dependents)).each { |matching_id|
+			@@objects_by_id[matching_id].producer_unregister(pattern_or_id, client) if @@objects_by_id[matching_id]
+			self.despawn(@@objects_by_id[matching_id]) if @@objects_by_id[matching_id] and (not @@objects_by_id[matching_id].alive?) and (not @@dependents[pattern_or_id])
+		}
+	end
+
+
+	def self.version_get(client,id,version)
+		raise "version_get called on starexp, that doesn't make sense" if id.starexp?
+		return [0,{}] if not @@objects_by_id.has_key?(id)
+		@@objects_by_id[id].version_get(version)
+	end
+
+
+	def self.version_set(client,id,version,data,requested_version)
+		raise "Update of pattern doesn't make sense" if id.starexp?
+
+		if requested_version != false
+			raise "client not in @@producing" if not @@producing[client]
+			raise "requested_version (%s) not in @@produced[id] (%s)"%[requested_version.inspect,@@produced[id].inspect] if not @@produced[id].include?(requested_version)
+			@@producing.delete(client)
+			@@produced[id].delete(requested_version)  # also on disconnection / unproducer / test
+			@@produced.delete(id) if @@produced[id].size == 0
+		end
+
+		if @@objects_by_id.has_key?(id) or @@dependents[id] or @@consumers.keys.find { |pattern| id =~ pattern.starexp }
+			object = (@@objects_by_id[id] or self.spawn(id))
+			accepted = object.version_set(data, version, requested_version)
+			if accepted
+				(@@dependents[id] or Set.new).each { |dependent_id|
+					raise if not @@objects_by_id.has_key?(dependent_id)
+					next if not (dependent = @@objects_by_id[dependent_id])
+					if dependent.version_needed and dependent.version_needed[id] and version.kind_of?(Integer) and dependent.version_needed[id].kind_of?(Integer) and dependent.version_needed[id] < version
+						dependent.version_needed[id] = version
+						enqueue(dependent)
+					end
+				}
+				if version.kind_of? Hash
+					object.version_needed = {} if not object.version_needed
+					old_dependencies = (@@dependencies[id] or Set.new)
+					new_dependencies = (@@dependencies[id] = Set.new(version.keys))
+					(new_dependencies - old_dependencies).each { |added_dependency|
+						object.version_needed[added_dependency] = [(@@objects_by_id[added_dependency] ? @@objects_by_id[added_dependency].version_latest : 0), (version[added_dependency] or 0)].max
+						dependent_add(added_dependency, object.id)
+					}
+					(old_dependencies & new_dependencies).each { |kept_dependency|
+						object.version_needed[kept_dependency] = [(@@objects_by_id[kept_dependency] ? @@objects_by_id[kept_dependency].version_latest : 0), (version[kept_dependency] or 0)].max
+					}
+					(old_dependencies - new_dependencies).each { |removed_dependency|
+						object.version_needed.delete(removed_dependency)
+						dependent_remove(removed_dependency, object.id)
+					}
+				else
+					object.version_needed = version
+				end
 			end
-			old_object = JSON.load(JSON.dump(@object))
-			old_version = @version
-			@object.clear if from_version == 0 or value != nil
-			begin
-				Hana::Patch.new(patch).apply(@object) if patch
-			rescue Exception => e
-				puts "Patching failed!\n        Old object: "+old_object.inspect+"\n        Patch: "+patch.inspect if DEBUG
-				raise e
+			enqueue(object)
+		end
+
+		dequeue(client,nil) if requested_version != false and not @@producing[client]
+	end
+
+
+	def self.cache_get(object_id, key)
+		return nil if not @@objects_by_id.has_key?(object_id)
+		@@objects_by_id[object_id].cache_get(key)
+	end
+
+
+	def self.cache_set(object_id, key, value)
+		return value if not @@objects_by_id.has_key?(object_id)
+		@@objects_by_id[object_id].cache_set(key, value)
+		value
+	end
+
+
+private
+
+
+	class SeapigObject
+
+		attr_reader :id, :versions, :direct_producers, :wildcard_producers
+		attr_accessor :version_needed
+
+		def initialize(id)
+			@id = id
+			@versions = [ [0, {}] ]
+			@direct_consumers = Set.new
+			@wildcard_consumers = {}
+			@direct_producers = Set.new
+			@wildcard_producers = {}
+			@version_needed = nil
+			@cache = []
+		end
+
+
+		def destroy
+			@wildcard_consumers.keys.each { |client|
+				client.object_destroy(@id)
+			}
+		end
+
+
+		def version_get(object_version)
+			@versions.assoc(object_version) or [0,{}]
+		end
+
+
+		def version_set(data,version,requested_version)
+			return false if data == nil
+			return false if not version_newer?(version)
+			@versions << [version,data]
+			(Set.new(@wildcard_consumers.keys)+@direct_consumers).each { |client| client.object_update(@id, version, data) } if data
+			versions_with_valid_data = 0
+			discard_below = @versions.size - 1
+			while discard_below > 0 and versions_with_valid_data < 1
+				versions_with_valid_data += 1 if @versions[discard_below][1]
+				discard_below -= 1
 			end
-			if value == false and not @stall_after
-				puts '        STALL' if DEBUG
-				@stall_after = old_version
+			discard_below.times { @versions.shift }
+			true
+		end
+
+
+		def version_latest
+			return nil if not @versions[-1]
+			@versions[-1][0]
+		end
+
+
+		def version_newer?(vb)
+			latest = version_latest
+			return latest <=> vb if (not latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
+			return -1            if (not latest.kind_of?(Hash)) and (    vb.kind_of?(Hash))
+			return  1            if (    latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
+			(latest.keys & vb.keys).each { |key|
+#				return true if latest[key] and (vb[key] == nil or vb[key] > latest[key])
+				return true if vb[key] > latest[key]
+			}
+			return vb.size < latest.size #THINK: is this the right way to go...
+		end
+
+
+		def consumer_register(pattern,client)
+			return false if ((not pattern.starexp?) and @direct_consumers.include?(client)) or (pattern.starexp? and @wildcard_consumers[client] and @wildcard_consumers[client].include?(pattern))
+			if pattern.starexp?
+				(@wildcard_consumers[client] ||= Set.new).add(pattern)
+			else
+				@direct_consumers.add(client)
 			end
-			@object.merge!(value) if value
-			@version = new_version
-			Client.all.each { |client| upload(client, old_version, old_object) }
-			SeapigObject.all.each { |object| object.check_validity }
-		elsif from_version > @version
-			puts "lost some updates, reinitializing object" if DEBUG
-			@version = 0
-			@object.clear
-			@valid = false
-			#assign mb?
+			latest_known_version, latest_known_data = @versions.reverse.find { |version,data| data }
+			(Set.new(@wildcard_consumers.keys)+@direct_consumers).each { |client| client.object_update(@id, latest_known_version, latest_known_data) }
+		end
+
+
+		def producer_register(pattern,client)
+			return false if ((not pattern.starexp?) and @direct_producers.include?(client)) or (pattern.starexp? and @wildcard_producers[client] and @wildcard_producers[client].include?(pattern))
+			if pattern.starexp?
+				(@wildcard_producers[client] ||= Set.new).add(pattern)
+			else
+				@direct_producers.add(client)
+			end
+		end
+
+
+		def consumer_unregister(pattern,client)
+			raise "Unregister without register" if (not @direct_consumers.include?(client)) and ((not @wildcard_consumers.has_key?(client)) or (not @wildcard_consumers[client].include?(pattern)))
+			if pattern.starexp?
+				@wildcard_consumers[client].delete(pattern)
+				@wildcard_consumers.delete(client) if @wildcard_consumers[client].size == 0
+			else
+				@direct_consumers.delete(client)
+			end
+		end
+
+
+		def producer_unregister(pattern,client)
+			raise "Unregister without register" if (not @direct_producers.include?(client)) and ((not @wildcard_producers.has_key?(client)) or (not @wildcard_producers[client].include?(pattern)))
+			if pattern.starexp?
+				@wildcard_producers[client].delete(pattern)
+				@wildcard_producers.delete(client) if @wildcard_producers[client].size == 0
+			else
+				@direct_producers.delete(client)
+			end
+		end
+
+
+		def cache_get(key)
+			ret = @cache.assoc(key)
+			puts "Cache "+(ret ? "hit" : "miss") if DEBUG
+			ret and	ret[1]
+		end
+
+
+		def cache_set(key, value)
+			@cache.delete(old_entry) if old_entry = @cache.assoc(key)
+			@cache << [key,value] if OBJECT_CACHE_SIZE > 0
+			@cache = @cache[-OBJECT_CACHE_SIZE..-1] if @cache.size > OBJECT_CACHE_SIZE
+		end
+
+
+		def alive?
+			(@direct_consumers.size > 0 or (@wildcard_consumers.size > 0 and @direct_producers.size > 0))
+		end
+
+
+		def inspect
+			'<SO:%s:%s:%s:%s:%s:%s:%s>'%[@id, @versions.map { |v| v[0] }.inspect,@direct_producers.map(&:id).inspect,@wildcard_producers.keys.map(&:id).inspect,@direct_consumers.map(&:id).inspect,@wildcard_consumers.keys.map(&:id).inspect,@version_needed.inspect]
+		end
+
+	end
+
+
+	def self.matching(pattern,check_against)
+		if pattern.starexp?
+			check_against.each_key.map { |id|
+				id if (not id.starexp?) and (id =~ pattern.starexp)
+			}.compact
 		else
-			puts "late update, ignoring" if DEBUG
+			(check_against.each_key.find { |id|
+				 (id.starexp? and pattern =~ id.starexp) or ((not id.starexp?) and pattern == id)
+			}) ? [pattern] : []
 		end
 	end
 
 
-	def upload(client, old_version, old_object, patch = nil)
-		return false if @stall_after
-		return false if not client.consumes.find { |object| (object == self) or self.matches?(object.id) }
-		old_version, old_object = [0, {}] if not client.versions[self] == old_version
-		json = JSON.dump(
-			action: 'object-update',
-			id: @id,
-			old_version: old_version,
-			new_version: @version,
-			patch: (patch or JsonDiff.generate(old_object, @object))) 
-		puts "Sending  %8iB  %s to %s"%[json.size, self.id, client.id] if DEBUG
-		client.versions[self] = @version
-		client.socket.send json
-	end
-
-	
-	def check_validity
-		@valid = if not @version.kind_of?(Hash) then (@version > 0) else not @version.to_a.find { |dependency_id, dependency_version|
-						SeapigObject[dependency_id] and SeapigObject[dependency_id].version and SeapigObject[dependency_id].version > dependency_version
-					} end
+	def self.spawn(id)
+		puts "Creating:\n        "+id if DEBUG
+		@@objects_by_id[id] = object = SeapigObject.new(id)
+		@@producers.each_pair.map { |pattern,clients| clients.each { |client| object.producer_register(pattern,client) if pattern.starexp? and (id =~ pattern.starexp) or (id == pattern) } }
+		@@consumers.each_pair.map { |pattern,clients| clients.each { |client| object.consumer_register(pattern,client) if pattern.starexp? and (id =~ pattern.starexp) or (id == pattern) } }
+		enqueue(object)
+		object
 	end
 
 
-	def inspect
-		'<SO:%s:%s:%s%s>'%[@id, @version, (@valid and 'V' or 'I'), (@stall_after and 'S' or 'U')]
+	def self.despawn(object)
+		puts "Deleting:\n        "+object.id if DEBUG
+		raise "Despawning object that should stay alive" if object.alive? or @@dependents[object.id]
+		object.destroy
+		(@@dependencies.delete(object.id) or []).each { |dependency_id|
+			dependent_remove(dependency_id, object.id)
+		}
+		@@objects_by_id.delete(object.id)
 	end
-	
+
+
+	def self.enqueue(object)
+		if object.version_needed and object.version_latest == object.version_needed
+			@@queue.delete(object)
+		else
+			return if @@queue.include?(object) or (@@produced[object.id] and @@produced[object.id].include?(object.version_needed))
+			@@queue << object
+			(Set.new(object.direct_producers) + object.wildcard_producers.keys).find { |client|
+				dequeue(client, object) if not @@producing[client]
+			}
+		end
+	end
+
+
+	def self.dequeue(client,object)
+		object = @@queue.find { |candidate_object| candidate_object.direct_producers.include?(client) or candidate_object.wildcard_producers.has_key?(client) } if not object
+		return false if not @@queue.include?(object)
+		version_snapshot = (object.version_needed == nil ? nil : object.version_needed.clone)
+		client.object_produce(object.id, version_snapshot)
+		@@queue.delete(object)
+		@@producing[client] = object
+		(@@produced[object.id] ||= Set.new) << version_snapshot
+	end
+
+
+	def self.dependent_add(id, dependent)
+		@@dependents[id] = Set.new if not @@dependents[id]
+		@@dependents[id] << dependent
+		self.matching(id, @@producers).each { |matching_id|
+			self.spawn(matching_id) if not @@objects_by_id[matching_id]
+		}
+	end
+
+
+	def self.dependent_remove(id, dependent)
+		@@dependents[id].delete(dependent)
+		@@dependents.delete(id) if @@dependents[id].size == 0
+		self.despawn(@@objects_by_id[id]) if @@objects_by_id.include?(id) and (not @@objects_by_id[id].alive?) and (not @@dependents[id])
+	end
+
+
+	def self.pp
+		[
+			"Objects:",   @@objects_by_id.values.map { |object| "        %s"%[object.inspect] }.join("\n"),
+			"Queue:",     @@queue.map { |object|                "        %s"%[object.inspect] }.join("\n"),
+			"Producing:", @@producing.map { |client,object|     "        %s - %s"%[client.id,object.id] }.join("\n"),
+			"Produced:",  @@produced.map { |object,versions|    "        %s - %s"%[object,versions.inspect] }.join("\n")
+		].select { |str| str.size > 0 }.join("\n")+"\n"
+	end
+
+
+
+
+
+
 end
 
 
 
+#TODO:
+# * Refactor to have ClientSpace class/module with Clients inside
+
+
 class Client
 
-	attr_reader :produces, :consumes, :socket, :producing, :index, :versions
+	attr_reader :produces, :consumes, :socket, :producing, :index, :pong_time
 	attr_accessor :options
 
 	@@clients_by_socket = {}
 	@@count = 0
 
-	
-	def self.[](id)
-		@@clients_by_socket[id]
-	end
 
-
-	def self.all
-		@@clients_by_socket.values
+	def self.[](socket)
+		@@clients_by_socket[socket]
 	end
 
 
 	def initialize(socket)
 		@index = @@count += 1
-		puts 'Client connected: '+@index.to_s if DEBUG
+		puts "Client connected:\n        "+@index.to_s if DEBUG
 		@socket = socket
 		@options = {}
-		@produces = []
-		@consumes = []
+		@produces = Set.new
+		@consumes = Set.new
 		@versions = {}
 		@producing = nil
 		@@clients_by_socket[socket] = self
+		self.pong
 	end
-	
+
 
 	def id
 		(@options['name'] or "") + ':' + @index.to_s
@@ -191,75 +470,178 @@ class Client
 
 
 	def destroy
-		puts 'Client disconnected: '+@index.to_s if DEBUG
+		puts "Client disconnected:\n        "+@index.to_s if DEBUG
 		@@clients_by_socket.delete(@socket)
-		SeapigObject.gc
-		Client.all.find { |client| client.assign(@producing) } if @producing and SeapigObject.all.include?(@producing)
+		@produces.each { |pattern| SeapigObjectStore.producer_unregister(pattern,self) }
+		@consumes.each { |pattern| SeapigObjectStore.consumer_unregister(pattern,self) }
+		producing = @producing
+		@producing = nil
+		SeapigObjectStore.version_set(self,producing[0],nil,nil,producing[1]) if producing
 	end
 
 
 	def producer_register(pattern)
-		@produces.push(pattern)
-		SeapigObject.all.each { |object| self.assign(object) }
+		@produces.add(pattern)
+		SeapigObjectStore.producer_register(pattern, self)
 	end
 
 
-	def consumer_register(object)
-		@consumes.push(object)
-		Client.all.each { |client| client.produces.each { |pattern| SeapigObject[pattern] if (not pattern.starexp?) and (pattern =~ object.id.starexp) } } if object.id.starexp?
-		SeapigObject.matching(object.id).each { |object|
-			Client.all.find { |client| client.assign(object) }
-			object.upload(self,0,{}) if object.valid
+	def producer_unregister(pattern)
+		@produces.delete(pattern)
+		SeapigObjectStore.producer_unregister(pattern, self)
+		if @producing and (pattern.starexp? ? (@producing[0] =~ pattern.starexp) : (@producing[0] == pattern)) #NOTE: overlaping production patterns are not supported
+			producing = @producing
+			@producing = nil
+			SeapigObjectStore.version_set(self,producing[0],nil,nil,producing[1])
+		end
+	end
+
+
+	def consumer_register(pattern)
+		@consumes.add(pattern)
+		SeapigObjectStore.consumer_register(pattern, self)
+	end
+
+
+	def consumer_unregister(pattern)
+		@consumes.delete(pattern)
+		SeapigObjectStore.consumer_unregister(pattern, self)
+		gc_versions
+	end
+
+
+	def gc_versions
+		@versions.keys.each { |object_id|
+			@versions.delete(object_id) if not (@consumes).find { |pattern|
+				pattern.starexp? and (object_id =~ pattern.starexp) or (pattern == object_id)
+			}
 		}
 	end
 
 
-	def consumer_unregister(object)
-		@consumes.delete(object)
-		@versions.delete(object)
-		SeapigObject.gc
+	def object_update(object_id, object_version, object_data)
+		#THINK: should we propagate stalls to clients?
+		return if object_version == 0 or object_version == @versions[object_id]
+		old_version, old_data = SeapigObjectStore.version_get(self,object_id,(@versions[object_id] or 0))
+		data = if old_version == 0
+			       { "value" => object_data }
+		       else
+			       diff = SeapigObjectStore.cache_get(object_id,[:diff,old_version,object_version])
+			       diff = SeapigObjectStore.cache_set(object_id,[:diff,old_version,object_version],JsonDiff.diff(old_data, object_data)) if not diff
+			       { "patch" => diff }
+		       end
+
+		json = Oj.dump({
+					 "action" => 'object-update',
+					 "id" => object_id,
+					 "old_version" => old_version,
+					 "new_version" => object_version,
+				 }.merge(data))
+		puts "Sending:\n        %8iB  %s to %s"%[json.size, object_id, id] if DEBUG
+		@versions[object_id] = object_version
+		@socket.send json
 	end
 
 
-	def assign(object)
-		puts 'Assign? %20s <> %-30s - %s'%[self.id, object.id, [object.valid,object.id.starexp?,@producing,Client.all.find { |client| client.producing == object },(not @produces.find { |pattern| object.id =~ pattern.starexp })].map { |b| b and 'T' or 'F' }.join('')] if DEBUG
-		return true if object.valid
-		return true if object.id.starexp?
-		return false if @producing
-		return true if Client.all.find { |client| client.producing == object }
-		return false if not @produces.find { |pattern| object.id =~ pattern.starexp }
-		puts 'Assigning: '+object.id+'    to: '+self.id if DEBUG
-		@socket.send JSON.dump(action: 'object-produce', id: object.id)
-		@producing = object
+	def object_destroy(object_id)
+		@socket.send Oj.dump("action" => 'object-destroy', "id" => object_id)
 	end
 
 
-	def release(object)
-		puts 'Releasing: '+object.id+'    from: '+self.id if DEBUG
-		@producing = nil if @producing == object
+	def object_patch(object_id, patch, value, from_version, to_version)
+		raise "patching wildcard object. no." if object_id.starexp?
+		requested_object_id, requested_version = @producing
+		if requested_object_id == object_id
+			@producing = nil
+		else
+			requested_version = false
+		end
+		new_version = to_version
+
+		new_data = if patch
+				   object_version, object_data = SeapigObjectStore.version_get(self,object_id,from_version)
+				   print "Patching:\n        version: "+object_version.inspect+"\n        from_version: "+from_version.inspect+"\n        to_version: "+to_version.inspect+"\n        patch_size: "+(patch and patch.size.to_s or "nil")+"\n        --> "  if DEBUG
+				   if from_version == object_version
+					   puts 'clean' if DEBUG
+					   new_data = Oj.load(Oj.dump(object_data))
+					   begin
+						   Hana::Patch.new(patch).apply(new_data) if patch
+					   rescue Exception => e
+						   puts "Patching failed!\n        Old object: "+object_data.inspect+"\n        Patch: "+patch.inspect if DEBUG
+						   raise e
+					   end
+					   new_data
+				   else
+					   puts "can't update object, couldn't find base version" if DEBUG
+					   nil
+				   end
+			   elsif value != nil
+				   print "Setting:\n        version: "+object_version.inspect+"\n        from_version: "+from_version.inspect+"\n        to_version: "+to_version.inspect+"\n        value_size: "+(value.inspect.size.to_s)+"\n"  if DEBUG
+				   value
+			   else
+				   nil
+			   end
+
+		SeapigObjectStore.version_set(self,object_id,new_version,new_data,requested_version)
 	end
 
-	
-	def ping
-		@socket.ping
+
+	def object_produce(object_id, object_version)
+		raise "Can't produce a wildcard object" if object_id.starexp?
+		raise "Client already producing something (producing: %s, trying to assign: %s)"%[@producing.inspect, [object_id,object_version].inspect] if @producing
+		raise "Can't produce that pattern: "+@produces.inspect+" "+object_id.inspect if not @produces.find { |pattern| object_id =~ pattern.starexp }
+		puts "Assigning:\n        "+object_id+':'+object_version.inspect+'    to: '+self.id if DEBUG
+		@socket.send Oj.dump("action" => 'object-produce', "id" => object_id)
+		@producing = [object_id, object_version]
 	end
 
-	
+
 	def pong
 		@pong_time = Time.new
 	end
 
-	
-	def check_ping_timeout
-		@socket.close if Time.new - pong > 60
+
+	def self.send_pings
+		@@clients_by_socket.keys.each { |socket| socket.ping }
 	end
 
 
-	def send_heartbeat
-		@socket.send JSON.dump(action: 'heartbeat') if @options['heartbeat']
+	def self.send_heartbeats
+		@@clients_by_socket.each_pair { |socket,client| socket.send Oj.dump(action: 'heartbeat') if client.options['heartbeat'] }
+	end
+
+
+	def self.check_ping_timeouts
+		@@clients_by_socket.each_pair { |socket,client| socket.close if Time.new - client.pong_time > 60 }
+	end
+
+
+	def self.pp
+		"Clients:\n"+@@clients_by_socket.values.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.to_a,client.consumes.to_a] }.join("\n")+"\n"
+	end
+end
+
+
+class InternalClient
+
+	def self.produce
+	end
+
+	def initialize
+		SeapigObjectStore.producer_register("SeapigServer::Objects", self)
+	end
+
+	def object_produce(object_id, object_version)
+		objects =
+		SeapigObjectStore.version_set(object_id,new_version,objects,object_version)
 	end
 
 end
+
+
+#TODO:
+# * change protocol to use "pattern" instead of "id"
+# * change "object-patch" to something nicer
 
 
 processing_times = []
@@ -268,63 +650,74 @@ processing_times_sum = 0
 EM.run {
 
 
-	WebSocket::EventMachine::Server.start(host: "0.0.0.0", port: 3001) { |client_socket|
-		
-		client_socket.onmessage { |message|
-			started_at = Time.new
-			client = Client[client_socket]
-			message = JSON.load message
-			puts "-"*80 + ' ' + Time.new.to_s if DEBUG
-			print "Message: %-20s    %-30s    %-50s"%[client.id, message['action'], JSON.dump(message.select { |k,v| ['pattern','id','options'].include?(k) })] if INFO
-			puts if DEBUG
-			object = SeapigObject[message['id']] if message['id']
-			case message['action']
-			when 'object-producer-register'
-				fail unless message['pattern']
-				client.producer_register(message['pattern'])
-			when 'object-producer-unregister'
-				fail unless message['pattern']
-				client.producer_unregister(message['pattern'])
-			when 'object-patch'
-				fail unless message['id'] and message['new_version'] and message['old_version']
-				client.release(object)
-				SeapigObject.gc
-				object.patch(message['patch'], message['value'], message['old_version'], message['new_version']) if SeapigObject.all.include?(object) # ignoring objects nobody listens to
-				SeapigObject.all.each { |object| Client.all.find { |client| client.assign(object) } }
-			when 'object-consumer-register'
-				fail unless message['id']
-				client.consumer_register(object)
-			when 'object-consumer-unregister'
-				fail unless message['id']
-				client.consumer_unregister(object)
-			when 'client-options-set'
-				fail unless message['options']
-				client.options = message['options']
-			else
-				puts '***** WTF, got message with action: ' + message['action'].inspect
-			end
-			processing_times << (Time.new.to_f - started_at.to_f)
-			processing_times_sum += processing_times[-1]
-			if DEBUG
-				puts "Clients:\n"+Client.all.map { |client| "        %-20s    produces:%s    consumes:%s"%[client.id,client.produces.inspect,client.consumes.map { |obj| obj.id }] }.join("\n")+"\n"
-				puts "Objects:\n"+SeapigObject.all.map { |object| "        %s"%[object.inspect] }.join("\n")+"\n"
-				puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
-				STDOUT.flush
-			end
-			puts "ct:%3i  t:%.3fs  Σt:%.3fs  t̅:%.3fs"%[processing_times.size, processing_times[-1],   processing_times_sum, processing_times_sum / processing_times.size,] if INFO and not DEBUG
+	WebSocket::EventMachine::Server.start(host: HOST, port: PORT) { |client_socket|
 
+		client_socket.onmessage { |message|
+			begin
+				started_at = Time.new
+				client = Client[client_socket]
+				message = Oj.load message
+				puts "-"*80 + ' ' + Time.new.to_s if DEBUG
+				print "Message:\n        from: %-20s\n        action: %-30s\n        param: %-50s "%[client.id, message['action'], Oj.dump(message.select { |k,v| ['pattern','id','options'].include?(k) })] if DEBUG
+				puts if DEBUG
+				object_id = message['id'] if message['id']
+				case message['action']
+				when 'object-producer-register'
+					fail unless message['pattern']
+					client.producer_register(message['pattern'])
+				when 'object-producer-unregister'
+					fail unless message['pattern']
+					client.producer_unregister(message['pattern'])
+				when 'object-patch'
+					fail unless message['id']
+					client.object_patch(object_id,message['patch'], message['value'], message['old_version'], message['new_version'])
+				when 'object-consumer-register'
+					fail unless message['id']
+					client.consumer_register(object_id)
+				when 'object-consumer-unregister'
+					fail unless message['id']
+					client.consumer_unregister(object_id)
+				when 'client-options-set'
+					fail unless message['options']
+					client.options = message['options']
+				else
+					raise 'WTF, got message with action: ' + message['action'].inspect
+				end
+				processing_times << (Time.new.to_f - started_at.to_f)
+				processing_times_sum += processing_times[-1]
+				if DEBUG
+					puts Client.pp
+					puts SeapigObjectStore.pp
+					puts "Processing:\n        time: %.3fs\n        count: %i\n        average: %.3fs\n        total: %.3fs"%[processing_times[-1], processing_times.size, processing_times_sum / processing_times.size, processing_times_sum]
+				end
+				puts "message:%3i  t:%.3fs  Σt:%.3fs  t̅:%.3fs"%[processing_times.size, processing_times[-1],   processing_times_sum, processing_times_sum / processing_times.size,] if INFO and not DEBUG
+			rescue => e
+				puts "Message processing error:\n        "
+				p e
+				e.backtrace.each { |line| puts line }
+				raise
+			end
 		}
 
-		
+
 		client_socket.onopen { Client.new(client_socket) }
 		client_socket.onclose { Client[client_socket].destroy if Client[client_socket] }
 		client_socket.onpong { Client[client_socket].pong }
 	}
 
+	puts "Listening on %s:%s"%[HOST,PORT] if INFO or DEBUG
         Socket.open(:UNIX, :DGRAM)  { |s| s.connect(Socket.pack_sockaddr_un(ENV['NOTIFY_SOCKET'])); s.sendmsg "READY=1" } if ENV['NOTIFY_SOCKET']
-	
-	EM.add_periodic_timer(10) { Client.all.each { |client|	client.ping  } }
-	EM.add_periodic_timer(10) { Client.all.each { |client|	client.check_ping_timeout  } }
-	EM.add_periodic_timer(10) { Client.all.each { |client|	client.send_heartbeat  } }
-	
+
+	EM.add_periodic_timer(10) { Client.send_pings }
+	EM.add_periodic_timer(10) { Client.send_heartbeats }
+	EM.add_periodic_timer(10) { Client.check_ping_timeouts }
+
+	EM.add_periodic_timer(1) {
+		now = Time.new
+		puts "CPU time used: %7.3f%%"%[(processing_times_sum-$last_processing_times_sum)*100.0/(now - $last_cpu_time)] if $last_cpu_time and DEBUG
+		$last_cpu_time = now
+		$last_processing_times_sum = processing_times_sum
+	}
+
+
 }
