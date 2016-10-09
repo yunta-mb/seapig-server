@@ -173,4 +173,14 @@ RSpec.describe "Seapig Server doesn't exhibit a bug where" do
 		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>{"dependency-a"=>10, "dependency-b"=>10}, "new_version"=>{"dependency-a"=>10}, "patch"=>[{"op"=>"replace", "path"=>"/v", "value"=>2}]}])
 	end
 
+	it "it crashes when upgrading version from integer to hash" do
+		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
+		@client.send(action: 'object-consumer-register', id: 'test-object-1')
+		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
+		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 0, new_version: 1)
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>0, "new_version"=>1, "value"=>{"v"=>1}}])
+		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 1, new_version: {"dependency-a"=>10, "dependency-b"=>10})
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>1, "new_version"=>{"dependency-a"=>10, "dependency-b"=>10}, "patch"=>[]}])
+	end
+
 end

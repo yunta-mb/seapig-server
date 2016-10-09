@@ -4,7 +4,7 @@
 require 'websocket-eventmachine-server'
 require 'narray'
 require 'oj'
-require 'json-diff'
+require 'jsondiff'
 require 'hana'
 require 'set'
 
@@ -18,7 +18,7 @@ OBJECT_CACHE_SIZE = 1
 
 $stdout.sync = true
 
-Oj.default_options = { mode: :strict }
+Oj.default_options = { mode: :compat }
 
 
 module WebSocket
@@ -141,6 +141,11 @@ module SeapigObjectStore
 	end
 
 
+	# data can be one of:
+	# - Hash  => given version corresponds to given data
+	# - false => given version has no data (aka. stall)
+	# - true  => given version exists (data unknown)
+	# - nil   => given version could not be generated (data unknown)
 	def self.version_set(client,id,version,data,requested_version)
 		raise "Update of pattern doesn't make sense" if id.starexp?
 
@@ -165,7 +170,7 @@ module SeapigObjectStore
 					end
 				}
 				if version.kind_of? Hash
-					object.version_needed = {} if not object.version_needed
+					object.version_needed = {} if (not object.version_needed) or object.version_needed.kind_of?(Integer)
 					old_dependencies = (@@dependencies[id] or Set.new)
 					new_dependencies = (@@dependencies[id] = Set.new(version.keys))
 					(new_dependencies - old_dependencies).each { |added_dependency|
@@ -237,7 +242,9 @@ private
 
 		def version_set(data,version,requested_version)
 			return false if data == nil
-			return false if not version_newer?(version)
+			return false if not SeapigObject.version_newer?(version_latest, version)
+			@version_needed = version if data == true and ((not @version_needed) or SeapigObject.version_newer?(@version_needed, version))
+			return false if data == true
 			@versions << [version,data]
 			(Set.new(@wildcard_consumers.keys)+@direct_consumers).each { |client| client.object_update(@id, version, data) } if data
 			versions_with_valid_data = 0
@@ -257,8 +264,7 @@ private
 		end
 
 
-		def version_newer?(vb)
-			latest = version_latest
+		def self.version_newer?(latest,vb)
 			return latest <=> vb if (not latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
 			return -1            if (not latest.kind_of?(Hash)) and (    vb.kind_of?(Hash))
 			return  1            if (    latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
@@ -390,7 +396,7 @@ private
 	def self.dequeue(client,object)
 		object = @@queue.find { |candidate_object| candidate_object.direct_producers.include?(client) or candidate_object.wildcard_producers.has_key?(client) } if not object
 		return false if not @@queue.include?(object)
-		version_snapshot = (object.version_needed == nil ? nil : object.version_needed.clone)
+		version_snapshot = (object.version_needed == nil ? nil : (object.version_needed.kind_of?(Fixnum) ? object.version_needed : object.version_needed.clone))
 		client.object_produce(object.id, version_snapshot)
 		@@queue.delete(object)
 		@@producing[client] = object
@@ -480,9 +486,10 @@ class Client
 	end
 
 
-	def producer_register(pattern)
+	def producer_register(pattern, known_version)
 		@produces.add(pattern)
 		SeapigObjectStore.producer_register(pattern, self)
+		SeapigObjectStore.version_set(self, pattern, known_version, true, false) if known_version and not pattern.starexp?
 	end
 
 
@@ -497,9 +504,11 @@ class Client
 	end
 
 
-	def consumer_register(pattern)
+	def consumer_register(pattern, known_version)
 		@consumes.add(pattern)
+		@versions[pattern] = known_version if not pattern.starexp?
 		SeapigObjectStore.consumer_register(pattern, self)
+		gc_versions
 	end
 
 
@@ -527,7 +536,7 @@ class Client
 			       { "value" => object_data }
 		       else
 			       diff = SeapigObjectStore.cache_get(object_id,[:diff,old_version,object_version])
-			       diff = SeapigObjectStore.cache_set(object_id,[:diff,old_version,object_version],JsonDiff.diff(old_data, object_data)) if not diff
+			       diff = SeapigObjectStore.cache_set(object_id,[:diff,old_version,object_version],JsonDiff.generate(old_data, object_data)) if not diff
 			       { "patch" => diff }
 		       end
 
@@ -607,7 +616,7 @@ class Client
 
 
 	def self.send_heartbeats
-		@@clients_by_socket.each_pair { |socket,client| socket.send Oj.dump(action: 'heartbeat') if client.options['heartbeat'] }
+		@@clients_by_socket.each_pair { |socket,client| socket.send Oj.dump('action' => 'heartbeat') if client.options['heartbeat'] }
 	end
 
 
@@ -664,7 +673,7 @@ EM.run {
 				case message['action']
 				when 'object-producer-register'
 					fail unless message['pattern']
-					client.producer_register(message['pattern'])
+					client.producer_register(message['pattern'],message['known-version'])
 				when 'object-producer-unregister'
 					fail unless message['pattern']
 					client.producer_unregister(message['pattern'])
@@ -673,7 +682,7 @@ EM.run {
 					client.object_patch(object_id,message['patch'], message['value'], message['old_version'], message['new_version'])
 				when 'object-consumer-register'
 					fail unless message['id']
-					client.consumer_register(object_id)
+					client.consumer_register(object_id,message['known-version'])
 				when 'object-consumer-unregister'
 					fail unless message['id']
 					client.consumer_unregister(object_id)

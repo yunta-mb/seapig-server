@@ -149,7 +149,7 @@ RSpec.describe "Seapig Server" do
 			@client.send(action: 'object-patch', id: 'test-object', value: false, old_version: 2, new_version: 3)
 			expect(@client.messages).to eq([])
 			@client.send(action: 'object-patch', id: 'test-object', value: {"f"=>3}, old_version: 3, new_version: 4)
-			expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object", "old_version"=>2, "new_version"=>4, "patch"=>[{"op"=>"remove", "path"=>"/x"}, {"op"=>"add", "path"=>"/f", "value"=>3}]}])
+			expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object", "old_version"=>2, "new_version"=>4, "patch"=>[{"op"=>"add", "path"=>"/f", "value"=>3}, {"op"=>"remove", "path"=>"/x"}]}])
 		end
 
 
@@ -646,6 +646,15 @@ RSpec.describe "Seapig Server" do
 			@client.send(action: 'object-consumer-register', id: 'dependency', latest_known_version: 0)
 			expect(@client.messages).to eq([])
 			expect(@client2.messages).to eq([])
+		end
+
+		it "it orders build of known object if new producer connects that knows newer version" do
+			@client.send(action: 'object-consumer-register', id: 'test-object-1', known_version: nil)
+			@client.send(action: 'object-producer-register', pattern: 'test-object-1', "known-version" => nil)
+			expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
+			@client2 = Client.new(@server)
+			@client2.send(action: 'object-producer-register', pattern: 'test-object-1', "known-version" => 1)
+			expect(@client2.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
 		end
 
 	end
