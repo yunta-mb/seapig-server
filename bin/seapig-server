@@ -265,9 +265,9 @@ private
 
 
 		def self.version_newer?(latest,vb)
-			return latest <=> vb if (not latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
-			return -1            if (not latest.kind_of?(Hash)) and (    vb.kind_of?(Hash))
-			return  1            if (    latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
+			return latest < vb   if (not latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
+			return true          if (not latest.kind_of?(Hash)) and (    vb.kind_of?(Hash))
+			return false         if (    latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
 			(latest.keys & vb.keys).each { |key|
 #				return true if latest[key] and (vb[key] == nil or vb[key] > latest[key])
 				return true if vb[key] > latest[key]

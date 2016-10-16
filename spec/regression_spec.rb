@@ -161,7 +161,7 @@ RSpec.describe "Seapig Server doesn't exhibit a bug where" do
 	end
 
 
-	it "it gets into production loop when key vanishes form version" do
+	it "gets into production loop when key vanishes form version" do
 		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
 		@client.send(action: 'object-consumer-register', id: 'test-object-1')
 		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
@@ -173,7 +173,8 @@ RSpec.describe "Seapig Server doesn't exhibit a bug where" do
 		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>{"dependency-a"=>10, "dependency-b"=>10}, "new_version"=>{"dependency-a"=>10}, "patch"=>[{"op"=>"replace", "path"=>"/v", "value"=>2}]}])
 	end
 
-	it "it crashes when upgrading version from integer to hash" do
+
+	it "crashes when upgrading version from integer to hash" do
 		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
 		@client.send(action: 'object-consumer-register', id: 'test-object-1')
 		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
@@ -182,5 +183,32 @@ RSpec.describe "Seapig Server doesn't exhibit a bug where" do
 		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 1, new_version: {"dependency-a"=>10, "dependency-b"=>10})
 		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>1, "new_version"=>{"dependency-a"=>10, "dependency-b"=>10}, "patch"=>[]}])
 	end
+
+
+	it "crashes because it accepted integer version_needed when already owning hash version_needed" do
+		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
+		@client.send(action: 'object-consumer-register', id: 'test-object-1')
+		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
+		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 0, new_version: {"test-object-2" => 0})
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>0, "new_version"=>{"test-object-2"=>0}, "value"=>{"v"=>1}}])
+		@client2 = Client.new(@server)
+		@client2.send(action: 'object-producer-register', pattern: 'test-object-1', "known-version" => 2)
+		expect(@client2.messages).to eq([])
+		@client.send(action: 'object-patch', id: 'test-object-2', value: {"v"=>1}, old_version: 0, new_version: 2)
+		expect(@client2.messages).to eq([])
+		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
+	end
+
+
+	it "accepts lower version" do
+		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
+		@client.send(action: 'object-consumer-register', id: 'test-object-1')
+		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1"}])
+		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 0, new_version: 2)
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>0, "new_version"=>2, "value"=>{"v"=>1}}])
+		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>2}, old_version: 0, new_version: 1)
+		expect(@client.messages).to eq([])
+	end
+
 
 end
