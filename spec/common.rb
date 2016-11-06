@@ -19,8 +19,9 @@ class ExternalProcess
 
 	def kill
 		ret = ''
-		Process.kill('KILL',@thread.pid) rescue Errno::ESRCH if @thread.status
-		Process.kill(9,@thread.pid) rescue Errno::ESRCH if @thread.status
+		Process.kill('INT',@thread.pid) rescue Errno::ESRCH if @thread.status
+		#sleep 0.1 while @thread.status
+		#Process.kill(9,@thread.pid) rescue Errno::ESRCH if @thread.status
 		ret += stdout(true)
 		ret += stderr(true)
 		sleep 0.01 while @thread.status
@@ -71,7 +72,7 @@ end
 class Server < ExternalProcess
 
 	def initialize
-		super("bundle exec ../bin/seapig-server debug")
+		super("bundle exec ./seapig-server-coverage-wrapper debug")
 		sleep 0.01 while not stdout =~ /Listening/
 	end
 

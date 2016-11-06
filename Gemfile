@@ -16,3 +16,4 @@ gemspec
 gem 'rdoc'
 gem 'rake'
 gem 'rspec'
+gem 'simplecov'

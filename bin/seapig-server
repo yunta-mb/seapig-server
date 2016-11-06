@@ -1,6 +1,5 @@
 #!/bin/env ruby
 # coding: utf-8
-
 require 'websocket-eventmachine-server'
 require 'narray'
 require 'oj'
@@ -161,6 +160,7 @@ module SeapigObjectStore
 			object = (@@objects_by_id[id] or self.spawn(id))
 			accepted = object.version_set(data, version, requested_version)
 			if accepted
+				puts "Version accepted" if DEBUG
 				(@@dependents[id] or Set.new).each { |dependent_id|
 					raise if not @@objects_by_id.has_key?(dependent_id)
 					next if not (dependent = @@objects_by_id[dependent_id])
@@ -174,11 +174,11 @@ module SeapigObjectStore
 					old_dependencies = (@@dependencies[id] or Set.new)
 					new_dependencies = (@@dependencies[id] = Set.new(version.keys))
 					(new_dependencies - old_dependencies).each { |added_dependency|
-						object.version_needed[added_dependency] = [(@@objects_by_id[added_dependency] ? @@objects_by_id[added_dependency].version_latest : 0), (version[added_dependency] or 0)].max
+						object.version_needed[added_dependency] = SeapigObject.version_newer((@@objects_by_id[added_dependency] ? @@objects_by_id[added_dependency].version_latest : 0), (version[added_dependency] or 0))
 						dependent_add(added_dependency, object.id)
 					}
 					(old_dependencies & new_dependencies).each { |kept_dependency|
-						object.version_needed[kept_dependency] = [(@@objects_by_id[kept_dependency] ? @@objects_by_id[kept_dependency].version_latest : 0), (version[kept_dependency] or 0)].max
+						object.version_needed[kept_dependency] = SeapigObject.version_newer((@@objects_by_id[kept_dependency] ? @@objects_by_id[kept_dependency].version_latest : 0), (version[kept_dependency] or 0))
 					}
 					(old_dependencies - new_dependencies).each { |removed_dependency|
 						object.version_needed.delete(removed_dependency)
@@ -265,14 +265,20 @@ private
 
 
 		def self.version_newer?(latest,vb)
+#			return true          if      latest.nil?            and (not vb.nil?)
+#			return false         if (not latest.nil?)           and      vb.nil?
 			return latest < vb   if (not latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
 			return true          if (not latest.kind_of?(Hash)) and (    vb.kind_of?(Hash))
 			return false         if (    latest.kind_of?(Hash)) and (not vb.kind_of?(Hash))
 			(latest.keys & vb.keys).each { |key|
-#				return true if latest[key] and (vb[key] == nil or vb[key] > latest[key])
-				return true if vb[key] > latest[key]
+				return true if version_newer?(latest[key], vb[key])
 			}
 			return vb.size < latest.size #THINK: is this the right way to go...
+		end
+
+
+		def self.version_newer(va,vb)
+			version_newer?(va,vb) ? vb : va
 		end
 
 
@@ -600,7 +606,7 @@ class Client
 		raise "Client already producing something (producing: %s, trying to assign: %s)"%[@producing.inspect, [object_id,object_version].inspect] if @producing
 		raise "Can't produce that pattern: "+@produces.inspect+" "+object_id.inspect if not @produces.find { |pattern| object_id =~ pattern.starexp }
 		puts "Assigning:\n        "+object_id+':'+object_version.inspect+'    to: '+self.id if DEBUG
-		@socket.send Oj.dump("action" => 'object-produce', "id" => object_id)
+		@socket.send Oj.dump("action" => 'object-produce', "id" => object_id, "version"=>object_version)
 		@producing = [object_id, object_version]
 	end
 
@@ -651,7 +657,6 @@ end
 #TODO:
 # * change protocol to use "pattern" instead of "id"
 # * change "object-patch" to something nicer
-
 
 processing_times = []
 processing_times_sum = 0
