@@ -20,11 +20,10 @@ class ExternalProcess
 	def kill
 		ret = ''
 		Process.kill('INT',@thread.pid) rescue Errno::ESRCH if @thread.status
-		#sleep 0.1 while @thread.status
-		#Process.kill(9,@thread.pid) rescue Errno::ESRCH if @thread.status
 		ret += stdout(true)
 		ret += stderr(true)
 		sleep 0.01 while @thread.status
+		p ret if @thread.value.stopsig and @thread.value.stopsig != 2
 		ret
 	end
 

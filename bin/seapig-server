@@ -112,23 +112,23 @@ module SeapigObjectStore
 
 
 	def self.consumer_unregister(pattern_or_id, client)
-		raise "Unregister without register" if not @@consumers[pattern_or_id].include?(client)
+		raise "Unregister without register" if (not @@consumers[pattern_or_id]) or (not @@consumers[pattern_or_id].include?(client))
 		@@consumers[pattern_or_id].delete(client)
 		@@consumers.delete(pattern_or_id) if @@consumers[pattern_or_id].size == 0
 		self.matching(pattern_or_id,@@producers.merge(@@objects_by_id)).each { |matching_id|
 			@@objects_by_id[matching_id].consumer_unregister(pattern_or_id, client) if @@objects_by_id[matching_id]
-			self.despawn(@@objects_by_id[matching_id]) if @@objects_by_id[matching_id] and (not @@objects_by_id[matching_id].alive?) and (not @@dependents[pattern_or_id])
+			self.despawn(@@objects_by_id[matching_id]) if @@objects_by_id[matching_id] and (not @@objects_by_id[matching_id].alive?) and (not @@dependents[matching_id])
 		}
 	end
 
 
 	def self.producer_unregister(pattern_or_id,client)
-		raise "Unregister without register" if not @@producers[pattern_or_id].include?(client)
+		raise "Unregister without register" if (not @@producers[pattern_or_id]) or (not @@producers[pattern_or_id].include?(client))
 		@@producers[pattern_or_id].delete(client)
 		@@producers.delete(pattern_or_id) if @@producers[pattern_or_id].size == 0
 		self.matching(pattern_or_id,@@consumers.merge(@@dependents)).each { |matching_id|
 			@@objects_by_id[matching_id].producer_unregister(pattern_or_id, client) if @@objects_by_id[matching_id]
-			self.despawn(@@objects_by_id[matching_id]) if @@objects_by_id[matching_id] and (not @@objects_by_id[matching_id].alive?) and (not @@dependents[pattern_or_id])
+			self.despawn(@@objects_by_id[matching_id]) if @@objects_by_id[matching_id] and (not @@objects_by_id[matching_id].alive?) and (not @@dependents[matching_id])
 		}
 	end
 
@@ -481,6 +481,11 @@ class Client
 	end
 
 
+	def inspect
+		id
+	end
+
+
 	def destroy
 		puts "Client disconnected:\n        "+@index.to_s if DEBUG
 		@@clients_by_socket.delete(@socket)
@@ -637,22 +642,6 @@ class Client
 end
 
 
-class InternalClient
-
-	def self.produce
-	end
-
-	def initialize
-		SeapigObjectStore.producer_register("SeapigServer::Objects", self)
-	end
-
-	def object_produce(object_id, object_version)
-		objects =
-		SeapigObjectStore.version_set(object_id,new_version,objects,object_version)
-	end
-
-end
-
 
 #TODO:
 # * change protocol to use "pattern" instead of "id"
@@ -733,5 +722,20 @@ EM.run {
 		$last_processing_times_sum = processing_times_sum
 	}
 
+
+	close_reader, close_writer = IO.pipe
+
+	EM.watch(close_reader) { |connection|
+		connection.notify_readable = true
+		connection.define_singleton_method(:notify_readable) do
+			puts "Shutting down" if INFO or DEBUG
+			exit
+		end
+	}
+
+	Signal.trap("INT") {
+		puts "SIGINT received, scheduling exit." if DEBUG
+		close_writer.write('.')
+	}
 
 }

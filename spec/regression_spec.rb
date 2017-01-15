@@ -211,6 +211,55 @@ RSpec.describe "Seapig Server doesn't exhibit a bug where it: " do
 	end
 
 
+	it "tries to despawn object on wildcard consumer disconnect if only remaining reason to stay alive is dependency" do
+		@client2 = Client.new(@server)
+		@client.send(action: 'object-consumer-register', id: 'test-object-1', latest_known_version: 0)
+		@client.send(action: 'object-consumer-register', id: 'test-object-2', latest_known_version: 0)
+		@client2.send(action: 'object-consumer-register', id: 'test-object-*', latest_known_version: 0)
+		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
+		@client.send(action: 'object-producer-register', pattern: 'test-object-2')
+		expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1", "version"=>nil}])
+		@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 0, new_version: {"test-object-2"=>2})
+		expect(@client2.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>0, "new_version"=>{"test-object-2"=>2}, "value"=>{"v"=>1}}])
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>0, "new_version"=>{"test-object-2"=>2}, "value"=>{"v"=>1}}, {"action"=>"object-produce", "id"=>"test-object-2", "version"=>nil}])
+		@client.send(action: 'object-patch', id: 'test-object-2', value: {"x"=>2}, old_version: 0, new_version: 1)
+		expect(@client2.messages).to eq([{"action"=>"object-update", "id"=>"test-object-2", "old_version"=>0, "new_version"=>1, "value"=>{"x"=>2}}])
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-2", "old_version"=>0, "new_version"=>1, "value"=>{"x"=>2}}])
+		@client.send(action: 'object-consumer-unregister', id: 'test-object-2')
+		expect(@client.messages).to eq([])
+		@client.send(action: 'object-producer-unregister', pattern: 'test-object-2')
+		expect(@client.messages).to eq([])
+		@client2.send(action: 'object-consumer-unregister', id: 'test-object-*')
+		expect(@client2.messages).to eq([]) #<RuntimeError: Despawning object that should stay alive>
+		@client2.send(action: 'object-consumer-register', id: 'test-object-2', latest_known_version: 0)
+		expect(@client.messages).to eq([])
+		expect(@client2.messages).to eq([{"action"=>"object-update", "id"=>"test-object-2", "old_version"=>0, "new_version"=>1, "value"=>{"x"=>2}}])
+	end
+
+
+	it "tries to despawn object on wildcard producer disconnect if only remaining reason to stay alive is dependency" do
+		@client2 = Client.new(@server)
+		@client.send(action: 'object-consumer-register', id: 'test-object-1', latest_known_version: 0)
+		@client.send(action: 'object-consumer-register', id: 'test-object-2', latest_known_version: 0)
+		@client2.send(action: 'object-producer-register', pattern: 'test-object-*', latest_known_version: 0)
+		expect(@client2.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1", "version"=>nil}])
+		expect(@client.messages).to eq([])
+		@client2.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, old_version: 0, new_version: {"test-object-2"=>2})
+		expect(@client2.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-2", "version"=>nil}])
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-1", "old_version"=>0, "new_version"=>{"test-object-2"=>2}, "value"=>{"v"=>1}}])
+		@client2.send(action: 'object-patch', id: 'test-object-2', value: {"x"=>2}, old_version: 0, new_version: 1)
+		expect(@client2.messages).to eq([])
+		expect(@client.messages).to eq([{"action"=>"object-update", "id"=>"test-object-2", "old_version"=>0, "new_version"=>1, "value"=>{"x"=>2}}])
+		@client.send(action: 'object-consumer-unregister', id: 'test-object-2')
+		expect(@client.messages).to eq([])
+		@client2.send(action: 'object-producer-unregister', pattern: 'test-object-*')
+		expect(@client2.messages).to eq([]) #<RuntimeError: Despawning object that should stay alive>
+		@client2.send(action: 'object-consumer-register', id: 'test-object-2', latest_known_version: 0)
+		expect(@client.messages).to eq([])
+		expect(@client2.messages).to eq([{"action"=>"object-update", "id"=>"test-object-2", "old_version"=>0, "new_version"=>1, "value"=>{"x"=>2}}])
+	end
+
+
 #	it "crashes upon receiving a nil version of object" do
 #		@client.send(action: 'object-producer-register', pattern: 'test-object-1')
 #		@client.send(action: 'object-consumer-register', id: 'test-object-1')

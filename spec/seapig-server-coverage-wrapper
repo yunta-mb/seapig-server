@@ -6,10 +6,8 @@ SimpleCov.start do
 	filters.clear
 	add_filter { |file| not file.filename.start_with?(Dir.pwd.split('/')[0..-2].join('/')) }
 #	add_filter { |file| file.filename =~ /.gem/ }
+	use_merging true
+	command_name "process_#{$$}"
 end
 
-SimpleCov.command_name 'Test:'+Time.new.strftime("%Y%m%d%H%M%S%6N")
-
 require_relative 'seapig-server.rb'
-
-
