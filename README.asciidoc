@@ -1,0 +1,175 @@
+Pig of the Sea
+==============
+
+Seapig is a master-slave object sharing system, that:
+
+* uses websockets for communication
+* synchronizes remote states instead of passing messages
+* only sends JSON-diffs over websocket when possible
+* handles re-synchronization of objects on link loss/regain
+* handles objects' lifetime:
+** orders object creation when listener appears
+** caches objects in memory
+** orders re-creation of objects when their dependencies change (e.g. immediately on db change)
+** destroys objects when last listener disconnects
+* (re-)creates objects in separate processes
+* works nicely with Mithril
+* https://www.youtube.com/watch?v=_y4DbZivHCY
+
+Deployment consists of:
+
+* central server - message router, doing diffs, re-sends, etc.
+* clients - can act as masters or slaves of seapig objects
+
+A seapig object is a json hash, associated with an id and a version.
+
+Related repos:
+
+* seapig-client-js - https://github.com/yunta-mb/seapig-client-js
+* seapig-client-ruby (also available as seapig-client gem) - https://github.com/yunta-mb/seapig-client-ruby
+* seapig-postgresql-notifier - https://github.com/yunta-mb/seapig-postgresql-notifier
+* seapig-router - https://github.com/yunta-mb/seapig-router
+
+
+== Basic use
+=== Browser JS client (coffee example)
+[source,javascript]
+----
+client = new SeapigClient('ws://'+window.location.host+'/seapig')
+obj = client.slave('my-object-xxx')
+obj.onchange -> console.log(obj.id, obj.version, obj.object)
+----
+
+=== Ruby client, in EM context:
+[source,ruby]
+----
+client = SeapigClient.new('ws://'+window.location.host+'/seapig')
+obj = client.slave('my-object-xxx')
+obj.onchange { p obj.id, obj.version, obj }
+----
+
+=== Server side (with rails and postgres helpers):
+
+For rails-less setup you'll have to provide arguments to some executables (hint: `--help`).
+
+- add following gems to your bundle:
+[source,ruby]
+----
+gem 'seapig-server'
+gem 'seapig-postgresql-notifier'
+----
+- add one db table:
+[source,bash]
+----
+rake seapig_engine:install:migrations
+rake db:migrate
+----
+- start seapig executables:
+[source,bash]
+----
+bundle exec seapig-server -v
+bundle exec seapig-rails-notifier
+----
+- in lib/seapigs create file that knows how to generate your my-object-xxx
+[source,ruby]
+----
+require './config/environment.rb'
+
+class ExecutionSingle < Producer
+
+	@patterns = [ 'my-object-xxx' ]
+
+	def self.produce(seapig_object_id)
+		version = SeapigDependency.versions('list-of-bicycles') #arbitrary string
+		data = { cars: Airplanes.all } # your generated object
+		[data, version]
+	end
+
+end
+----
+
+- start seapig worker (one or more, up to you):
+[source,ruby]
+----
+bundle exec seapig-worker
+----
+- in places where you modify airplanes table include this after transaction:
+[source,ruby]
+----
+SeapigDependency.bump("list-of-bicycles") #same string as in producer
+----
+
+== Debugging/introspection:
+
+Seapig-client-js repo has a seapig-viewer.html that you can use to observe state of your seapig server (use with addresses like ws://localhost:3001).
+
+There is also console tool called seapig-observer in seapig-client-ruby repo.
+
+
+== Advanced concepts:
+
+=== Wildcard consumers
+Following `update` callback will be called on updates of my-object-xxx, my-object-yyy and all other objects (1) with names matching the wildcard pattern.
+[source,ruby]
+----
+client.slave('my-object-*').onupdate { |object| }
+----
+(1) all cached plus all (non-wildcard-)generateable objects
+
+=== Wildcard producers
+Following `produce` will be called to produce my-object-xxx, my-object-yyy and all other objects (2) with names matching the wildcard pattern.
+[source,ruby]
+----
+class ExecutionSingle < Producer
+
+	@patterns = [ 'my-object-*' ]
+
+	def self.produce(seapig_object_id)
+		...
+	end
+
+end
+----
+(2) all objects having non-wildcard consumers
+
+=== Versions and dependencies
+
+When producing an object, you can give it version as one of:
+
+* a number (integer or float)
+* an array of numbers (integers or floats)
+* a hash of `object_id: version`
+
+If you go for hash, seapig server will interpret it as dependencies declaration. An object with version declared as `{ "object-b": 12 }` will be automatically re-produced when version of object-b increases above 12.
+
+=== Client-side master objects
+
+There are 2 ways to do it (don't mix them!):
+
+* you always keep your object up-to-date, and pig lib handles communication and events
+----
+client = SeapigClient.new(URL)
+obj = client.master('my-object-xxx', object: { "initial" => "content" })
+
+obj["aaa"] = 1234
+obj.bump() # increases object version and notifies server
+----
+
+* you register `onproduce` callback and provide new object state and version every time it's called
+
+----
+client = SeapigClient.new(URL)
+obj = client.master('my-object-xxx')
+obj.onproduce {
+	obj.set(object: { "zzz" => "yyy" }, version: 10)
+}
+----
+
+
+
+== Current limitations:
+
+- there is no rate-limiting on object re-creation
+- server is a single-process (in future release all json operations and client communication will be done in separate processes)
+- there is no safety/security (clients can easily crash the server, or get any data they want)
+- object identifiers are strings, leading to linear complexities (will probably be class(string) + descriptor(hash) in future releases)

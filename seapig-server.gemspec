@@ -1,12 +1,12 @@
 $:.push File.expand_path("../lib", __FILE__)
 
 # Maintain your gem's version:
-require "seapig/version"
+require "seapig-server/version"
 
 # Describe your gem and declare its dependencies:
 Gem::Specification.new do |s|
   s.name        = "seapig-server"
-  s.version     = Seapig::VERSION
+  s.version     = SeapigServer::VERSION
   s.authors     = ["yunta"]
   s.email       = ["maciej.blomberg@mikoton.com"]
   s.homepage    = "https://github.com/yunta-mb/seapig-server"
@@ -24,5 +24,6 @@ Gem::Specification.new do |s|
   s.add_dependency "jsondiff"
   s.add_dependency "hana"
   s.add_dependency "oj"
+  s.add_dependency "slop"
 
 end

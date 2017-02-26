@@ -41,7 +41,7 @@ class ExternalProcess
 	def stdout(closing = false)
 		sleep 0.1
 		@stdout_buffer = ""
-		@stdout_buffer += @stdout.read_nonblock(100000) while true
+		@stdout_buffer += @stdout.read_nonblock(200000) while true
 	rescue IO::EAGAINWaitReadable
 		@stdout_buffer
 	rescue EOFError
@@ -53,7 +53,7 @@ class ExternalProcess
 	def stderr(closing = false)
 		sleep 0.1
 		@stderr_buffer = ""
-		@stderr_buffer += @stderr.read_nonblock(100000) while true
+		@stderr_buffer += @stderr.read_nonblock(200000) while true
 	rescue IO::EAGAINWaitReadable
 		@stderr_buffer
 	rescue EOFError
@@ -70,8 +70,8 @@ end
 
 class Server < ExternalProcess
 
-	def initialize
-		super("bundle exec ./seapig-server-coverage-wrapper debug")
+	def initialize(args="")
+		super("SEAPIG_SERVER_SESSION=1 bundle exec ./seapig-server-coverage-wrapper -d "+args)
 		sleep 0.01 while not stdout =~ /Listening/
 	end
 
@@ -113,7 +113,7 @@ class Client
 			rescue IO::EAGAINWaitReadable
 			rescue EOFError => e
 				puts @server.kill
-			raise 'Server died'
+				raise 'Server died'
 			end
 		end
 
