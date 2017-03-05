@@ -248,7 +248,7 @@ RSpec.describe "Seapig Server" do
 		end
 
 
-		it "IMPLEMENTATION SPECIFIC: object is deleted when last listener unlistens ", xxx: true do # this is only valid for minimim-caching servers
+		it "IMPLEMENTATION SPECIFIC: object is deleted when last listener unlistens ", xxx: true do # this is only valid for minimum-caching servers
 			@client.send(action: 'object-consumer-register', pattern: 'test-object-1', 'version-known': 0)
 			@client.send(action: 'object-producer-register', pattern: 'test-object-1')
 			expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1", "version-inferred"=>nil}])
@@ -269,15 +269,15 @@ RSpec.describe "Seapig Server" do
 		end
 
 
-		it "IMPLEMENTATION SPECIFIC: object received from non-producer is not retained" do # this is only valid for minimim-caching servers
+		it "IMPLEMENTATION SPECIFIC: object received from non-producer is not retained" do # this is only valid for minimum-caching servers
 			@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, 'version-old': 0, 'version-new': 1)
-			expect(@client.messages).to eq([])
+			expect(@client.messages).to eq([{"action"=>"object-destroy", "id"=>"test-object-1"}])
 			@client.send(action: 'object-consumer-register', pattern: 'test-object-1', 'version-known': 0)
 			expect(@client.messages).to eq([])
 		end
 
 
-		it "IMPLEMENTATION SPECIFIC: object is deleted when last listener unlistens, by disconnecting" do # this is only valid for minimim-caching servers
+		it "IMPLEMENTATION SPECIFIC: object is deleted when last listener unlistens, by disconnecting" do # this is only valid for minimum-caching servers
 			@client.send(action: 'object-consumer-register', pattern: 'test-object-1', 'version-known': 0)
 			@client.send(action: 'object-producer-register', pattern: 'test-object-1')
 			expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1", "version-inferred"=>nil}])
@@ -726,6 +726,12 @@ RSpec.describe "Seapig Server" do
 			@client2.send(action: 'object-patch', id: 'test-object-2', value: {}, 'version-old': 0, 'version-new': 12)
 			expect(@client.messages).to eq([{"action"=>"object-produce", "id"=>"test-object-1", "version-inferred"=>{"test-object-2"=>12}}])
 
+		end
+
+
+		it "notifies of destruction if submitted object has no consumers" do
+			@client.send(action: 'object-patch', id: 'test-object-1', value: {"v"=>1}, 'version-old': 0, 'version-new': 1)
+			expect(@client.messages).to eq([{"action"=>"object-destroy", "id"=>"test-object-1"}])
 		end
 
 	end

@@ -11,7 +11,7 @@ Gem::Specification.new do |s|
   s.email       = ["maciej.blomberg@mikoton.com"]
   s.homepage    = "https://github.com/yunta-mb/seapig-server"
   s.summary     = "Transient object synchronization lib - server"
-  s.description = "meh"
+  s.description = "Seapig is a master-slave object sharing system."
   s.license     = "MIT"
 
   s.files = Dir["{lib}/**/*", "MIT-LICENSE", "Rakefile", "README.rdoc", "bin/seapig-*"]

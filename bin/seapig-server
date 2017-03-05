@@ -65,8 +65,6 @@ end
 
 
 if OPTIONS["debug-memory"]
-	#require 'memory_profiler'
-	#MemoryProfiler.start
 	require 'objspace'
 	ObjectSpace.trace_object_allocations_start
 	$dump_heap = false
@@ -305,6 +303,8 @@ class SeapigObjectStore
 				}
 			end
 			enqueue(object)
+		else
+			client.object_destroy(id) if data != nil
 		end
 
 		if was_producing and not client.producing
@@ -863,11 +863,12 @@ class SeapigWebsocketClient
 	end
 
 
-	def destroy
-		puts "Client disconnected:\n        "+@index.to_s if DEBUG
+	def destroy(reason)
+		puts "Client %s disconnected: %s\n"%[id, reason.inspect] if DEBUG
 		@@clients_by_socket.delete(@socket)
 		@seapig_object_store.client_unregister(self, self)
 		@seapig_object_store.connection_unregister(self)
+		@socket.close
 	end
 
 
@@ -983,17 +984,17 @@ class SeapigWebsocketClient
 
 
 	def self.send_pings
-		@@clients_by_socket.keys.each { |socket| socket.ping }
+		@@clients_by_socket.keys.each { |client_socket| client_socket.ping }
 	end
 
 
 	def self.send_heartbeats
-		@@clients_by_socket.each_pair { |socket,client| socket.send Oj.dump('action' => 'heartbeat') if client.options['heartbeat'] }
+		@@clients_by_socket.each_pair { |client_socket, client| client_socket.send Oj.dump('action' => 'heartbeat') if client.options['heartbeat'] }
 	end
 
 
 	def self.check_ping_timeouts
-		@@clients_by_socket.each_pair { |socket,client| socket.close if Time.new - client.pong_time > 60 }
+		@@clients_by_socket.each_pair { |client_socket, client| SeapigWebsocketClient[client_socket].destroy("Ping timeout") if Time.new - client.pong_time > 60 }
 	end
 
 end
@@ -1035,8 +1036,8 @@ EM.run {
 	WebSocket::EventMachine::Server.start(host: HOST, port: PORT) { |client_socket|
 
 		client_socket.onmessage &safety_net { |message_json|
+			next if not client = SeapigWebsocketClient[client_socket]
 			started_at = Time.new
-			client = SeapigWebsocketClient[client_socket]
 			message = Oj.load message_json
 			puts "-"*80 + ' ' + Time.new.to_s if DEBUG
 			print "Message:\n        from: %-20s\n        action: %-30s\n        param: %-50s "%[client.id, message['action'], Oj.dump(message.select { |k,v| ['pattern','id','options'].include?(k) })] if DEBUG
@@ -1077,8 +1078,9 @@ EM.run {
 
 
 		client_socket.onopen &safety_net { SeapigWebsocketClient.new(seapig_object_store, client_socket) }
-		client_socket.onclose &safety_net { SeapigWebsocketClient[client_socket].destroy if SeapigWebsocketClient[client_socket] }
-		client_socket.onpong &safety_net { SeapigWebsocketClient[client_socket].pong }
+		client_socket.onclose &safety_net { SeapigWebsocketClient[client_socket].destroy("Connection closed") if SeapigWebsocketClient[client_socket] }
+		client_socket.onerror &safety_net { |error| SeapigWebsocketClient[client_socket].destroy(error) if SeapigWebsocketClient[client_socket] }
+		client_socket.onpong &safety_net { SeapigWebsocketClient[client_socket].pong if SeapigWebsocketClient[client_socket] }
 	}
 
 	puts "Listening on %s:%s"%[HOST,PORT] if INFO or DEBUG
@@ -1097,8 +1099,6 @@ EM.run {
 		if $dump_heap
 			$dump_heap = false
 			GC.start
-			#MemoryProfiler.stop.pretty_print(to_file: "memory_"+Time.new.strftime("%Y%m%d%H%M%S"))
-			#MemoryProfiler.start
 			open("heap_dump_"+Time.new.strftime("%Y%m%d%H%M%S"),"w") { |file| ObjectSpace.dump_all(output: file) }
 		end
 	})
