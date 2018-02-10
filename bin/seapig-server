@@ -15,6 +15,7 @@ OPTIONS = Slop.parse { |o|
 	o.bool '-d', '--debug', 'Show debug messages'
 	o.bool '-dm', '--debug-memory', 'Turn on allocation tracing'
 	o.bool '-v', '--verbose', 'Show info messages'
+	o.bool '-f', '--disable-json-diff', 'Disable diffing algorithm'
 	o.on '-h', '--help' do puts o; exit end
 }
 
@@ -22,13 +23,14 @@ DEBUG = OPTIONS.debug?
 INFO = (OPTIONS.verbose? or DEBUG)
 HOST = OPTIONS["listen"].split(":")[0]
 PORT = (OPTIONS["port"] or (OPTIONS["listen"].split(':')[1] or "3001").to_i)
+DISABLE_DIFF = OPTIONS.disable_json_diff?
 
 OBJECT_CACHE_SIZE = 1
 
 $stdout.sync = true
 $stderr.sync = true
 
-Oj.default_options = { mode: :compat }
+Oj.default_options = { mode: :strict }
 
 
 
@@ -911,7 +913,7 @@ class SeapigWebsocketClient
 		#THINK: should we propagate stalls to clients?
 		return if object_version == 0 or object_version == @versions[object_id]
 		old_version, old_data = @seapig_object_store.version_get(self, self, object_id, (@versions[object_id] or 0))
-		data = if old_version == 0
+		data = if old_version == 0 or DISABLE_DIFF
 			       { "value" => object_data }
 		       else
 			       diff = @seapig_object_store.cache_get(self, self, object_id,[:diff,old_version,object_version])
